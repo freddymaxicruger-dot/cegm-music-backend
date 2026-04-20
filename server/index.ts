@@ -4,10 +4,11 @@
  */
 
 import express from 'express';
-import cors from 'cors';
+import { Innertube, UniversalCache } from 'youtubei.js';
+import axios from 'axios';
 import dotenv from 'dotenv';
 import play from 'play-dl';
-import https from 'https';
+// import https from 'https'; // Reemplazado por Innertube logic
 import {
   searchMusic,
   getTrendingMusic,
@@ -34,8 +35,43 @@ if (process.env.YOUTUBE_COOKIE) {
 // Configurar un User-Agent global para Play-DL
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// Escudo Anti-Caídas Global
+process.on('uncaughtException', (err) => {
+  console.error('🔥 CRITICAL: Uncaught Exception:', err.message);
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  console.error('🔥 CRITICAL: Unhandled Rejection:', reason?.message || reason);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Inicializacin de Innertube (Cargado una sola vez para mayor eficiencia)
+let innertube: Innertube | null = null;
+
+async function initInnertube() {
+  try {
+    // Usamos caché para evitar peticiones repetitivas de configuracin
+    innertube = await Innertube.create({
+      cache: new UniversalCache(false),
+      generate_session_locally: true
+    });
+    
+    if (process.env.YOUTUBE_COOKIE) {
+      await innertube.session.signIn({
+        cookie: process.env.YOUTUBE_COOKIE
+      });
+      console.log('✅ Innertube: Sesin iniciada con cookies');
+    } else {
+      console.log('⚠️ Innertube: Iniciado en modo invitado (sin cookies)');
+    }
+  } catch (error: any) {
+    console.error('❌ Innertube Init Error:', error.message);
+  }
+}
+
+initInnertube();
 
 // Middleware
 app.use(cors());
@@ -227,59 +263,58 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
     console.log(`📡 Streaming request for: ${videoId}`);
 
-    // Extraer la URL directa del audio (ms estable que play.stream() para evitar bloqueos)
-    const info = await play.video_info(url);
-    const audioFormat = info.format
-      .filter(f => f.mimeType?.includes('audio'))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-
-    if (!audioFormat || !audioFormat.url) {
-       throw new Error('No direct entry points found for this track');
+    if (!innertube) {
+       await initInnertube();
     }
 
+    if (!innertube) {
+       throw new Error('Streaming engine not initialized');
+    }
+
+    // Obtenemos la informacin del video usando la API interna "Innertube"
+    const info = await innertube.getInfo(videoId);
+    
+    // Filtramos para obtener el mejor formato de audio
+    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+
+    if (!format || !format.decipher(innertube.session.player)) {
+       throw new Error('Could not decipher or find a valid audio format');
+    }
+
+    const downloadUrl = format.decipher(innertube.session.player);
+    if (!downloadUrl) throw new Error('Decipher failed');
+
     // Cabeceras cruciales para ExoPlayer y navegadores
-    res.setHeader('Content-Type', audioFormat.mimeType || 'audio/mpeg');
+    res.setHeader('Content-Type', format.mime_type || 'audio/mpeg');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     
-    if (audioFormat.contentLength) {
-       res.setHeader('Content-Length', audioFormat.contentLength);
+    if (format.content_length) {
+       res.setHeader('Content-Length', format.content_length);
     }
 
-    // Pipe manual usando el protocolo HTTPS para evitar el overhead del agente de play-dl
-    const options = {
-       headers: {
-          'User-Agent': USER_AGENT,
-          'Cookie': process.env.YOUTUBE_COOKIE || ''
-       }
-    };
-
-    https.get(audioFormat.url, options, (stream) => {
-      if (stream.statusCode && stream.statusCode >= 400) {
-         console.error(`❌ YouTube rejected stream: ${stream.statusCode}`);
-         if (!res.headersSent) res.status(stream.statusCode).end();
-         return;
-      }
-
-      stream.pipe(res);
-
-      stream.on('error', (err) => {
-        console.error('❌ Pipe error:', err.message);
-        if (!res.headersSent) res.status(500).end();
-      });
-    }).on('error', (err) => {
-      console.error('❌ Request error:', err.message);
-      if (!res.headersSent) res.status(500).end();
+    // Descargamos y enviamos el flujo directamente
+    const stream = await info.download({
+      type: 'audio',
+      quality: 'best',
+      client: 'YTMUSIC' // Forzamos cliente de Msica para mejor calidad/compatibilidad
     });
 
-    req.on('close', () => {
-      // Conexin cerrada por el cliente
-    });
+    // Innertube download devuelve un ReadableStream (Web API) o un Iterable
+    // Lo convertimos a Node Stream si es necesario o usamos el Reader
+    const reader = stream.getReader();
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+    
+    res.end();
 
   } catch (error: any) {
     console.error('❌ Stream proxy error:', error.message);
     if (!res.headersSent) {
-       // Si es un 429, devolvemos un mensaje claro en lugar de dejar que el cliente espere
        const status = error.message.includes('429') ? 429 : 500;
        res.status(status).json({ error: error.message });
     }
