@@ -204,33 +204,79 @@ import youtubedl from 'youtube-dl-exec';
 
 // ... 
 /**
- * GET /api/stream/:videoId
- * Gets the direct raw audio url from youtube to bypass iframe restrictions.
+ * GET /api/stream/audio/:videoId
+ * Specialized streaming proxy for ExoPlayer/HTML5 Audio
+ * Supports HTTP Range requests for seeking and fast buffering.
  */
-app.get('/api/stream/:videoId', async (req, res) => {
+app.get('/api/stream/audio/:videoId', async (req, res) => {
   try {
     const videoId = req.params.videoId;
-    if (!videoId) {
-      return res.status(400).json({ error: 'Video ID is required' });
-    }
+    if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
 
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    
-    // Use play-dl (native Node.js) for 10x faster extraction than yt-dlp
     const info = await play.video_info(url);
-    const format = play.choose_format(info.format, { quality: 'highestaudio' });
+    
+    // play-dl no tiene choose_format, filtramos manualmente los formatos de audio
+    const format = info.format
+      .filter(f => f.mimeType?.includes('audio'))
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+    if (!format || !format.url) {
+      return res.status(500).json({ error: 'Could not extract audio format' });
+    }
+
+    const streamUrl = format.url;
+    
+    // Configurar el streaming con soporte para Range (vital para ExoPlayer)
+    const range = req.headers.range;
+    
+    if (range) {
+      // Proxy con Range support
+      https.get(streamUrl, { headers: { range } }, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode || 206, proxyRes.headers);
+        proxyRes.pipe(res);
+      }).on('error', (e) => {
+        console.error('Proxy Stream Error:', e);
+        if (!res.headersSent) res.status(500).end();
+      });
+    } else {
+      // Proxy standard
+      https.get(streamUrl, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+        proxyRes.pipe(res);
+      }).on('error', (e) => {
+        console.error('Proxy Stream Error:', e);
+        if (!res.headersSent) res.status(500).end();
+      });
+    }
+
+  } catch (error: any) {
+    console.error('Stream proxy error:', error.message);
+    if (!res.headersSent) res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/stream/:videoId
+ * Original endpoint for compatibility - still returns direct URL if needed
+ */
+app.get('/api/stream/:videoId', async (req, res) => {
+  // ... (existing logic kept for compat)
+  try {
+    const videoId = req.params.videoId;
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const info = await play.video_info(url);
+    const format = info.format
+      .filter(f => f.mimeType?.includes('audio'))
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
     
     if (format && format.url) {
       res.json({ url: format.url });
     } else {
-      res.status(500).json({ error: 'Could not extract audio url' });
+      res.status(500).json({ error: 'Extraction failed' });
     }
-
-  } catch (error: any) {
-    console.error('Stream initialization error:', error.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: error.message });
-    }
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -252,7 +298,9 @@ app.get('/api/download/:videoId', async (req, res) => {
 
     // Extract the raw media URL using play-dl (much faster than youtube-dl-exec)
     const info = await play.video_info(url);
-    const format = play.choose_format(info.format, { quality: 'highestaudio' });
+    const format = info.format
+      .filter(f => f.mimeType?.includes('audio'))
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
     
     if (!format || !format.url) {
       return res.status(500).json({ error: 'Could not extract audio url' });
