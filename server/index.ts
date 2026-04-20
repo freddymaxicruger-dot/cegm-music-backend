@@ -374,7 +374,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`\n🎵 CEGM Music Server running on http://localhost:${PORT}`);
   console.log(`📡 YouTube API Key: ${process.env.YOUTUBE_API_KEY ? '✅ Configured' : '❌ Missing'}`);
   console.log(`\nEndpoints:`);
