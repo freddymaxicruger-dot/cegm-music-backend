@@ -4,6 +4,7 @@
  */
 
 import express from 'express';
+import cors from 'cors';
 import { Innertube, UniversalCache } from 'youtubei.js';
 import axios from 'axios';
 import dotenv from 'dotenv';
@@ -59,10 +60,15 @@ async function initInnertube() {
     });
     
     if (process.env.YOUTUBE_COOKIE) {
-      await innertube.session.signIn({
-        cookie: process.env.YOUTUBE_COOKIE
-      });
-      console.log('✅ Innertube: Sesin iniciada con cookies');
+      try {
+        await innertube.session.signIn({
+          cookie: process.env.YOUTUBE_COOKIE
+        });
+        console.log('✅ Innertube: Sesin iniciada con cookies');
+      } catch (signInError: any) {
+        console.error('⚠️ Innertube SignIn Error:', signInError.message);
+        console.log('🔄 Cayendo a modo invitado para no bloquear el arranque...');
+      }
     } else {
       console.log('⚠️ Innertube: Iniciado en modo invitado (sin cookies)');
     }
