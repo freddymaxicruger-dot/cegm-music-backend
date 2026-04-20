@@ -290,33 +290,12 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     const downloadUrl = format.decipher(innertube.session.player);
     if (!downloadUrl) throw new Error('Decipher failed');
 
-    // Cabeceras cruciales para ExoPlayer y navegadores
-    res.setHeader('Content-Type', format.mime_type || 'audio/mpeg');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
+    // ¡NUEVA ARQUITECTURA!
+    // Ya no hacemos un "pipe" infinito que consume el ancho de banda
+    // de Render y dispara las alertas Anti-Bot.
+    // Simplemente le damos al Frontend la URL directa descifrada.
     
-    if (format.content_length) {
-       res.setHeader('Content-Length', format.content_length);
-    }
-
-    // Descargamos y enviamos el flujo directamente
-    const stream = await info.download({
-      type: 'audio',
-      quality: 'best',
-      client: 'YTMUSIC' // Forzamos cliente de Msica para mejor calidad/compatibilidad
-    });
-
-    // Innertube download devuelve un ReadableStream (Web API) o un Iterable
-    // Lo convertimos a Node Stream si es necesario o usamos el Reader
-    const reader = stream.getReader();
-    
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(value);
-    }
-    
-    res.end();
+    res.json({ url: downloadUrl, quality: format.audio_quality, mime: format.mime_type });
 
   } catch (error: any) {
     console.error('❌ Stream proxy error:', error.message);
