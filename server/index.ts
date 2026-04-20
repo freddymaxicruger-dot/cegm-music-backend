@@ -283,12 +283,21 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     // Filtramos para obtener el mejor formato de audio
     const format = info.chooseFormat({ type: 'audio', quality: 'best' });
 
-    if (!format || !format.decipher(innertube.session.player)) {
-       throw new Error('Could not decipher or find a valid audio format');
+    if (!format) {
+       throw new Error('No valid audio format found');
     }
 
-    const downloadUrl = format.decipher(innertube.session.player);
-    if (!downloadUrl) throw new Error('Decipher failed');
+    // Algunas canciones ya vienen con la URL directa, otras necesitan descifrado
+    let downloadUrl = format.url;
+    if (!downloadUrl) {
+        try {
+            downloadUrl = format.decipher(innertube.session.player);
+        } catch (e) {
+            console.error('Decipher warning:', e);
+        }
+    }
+
+    if (!downloadUrl) throw new Error('Decipher failed or no URL available');
 
     // ¡NUEVA ARQUITECTURA!
     // Ya no hacemos un "pipe" infinito que consume el ancho de banda
