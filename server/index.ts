@@ -7,6 +7,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import play from 'play-dl';
+import https from 'https';
 import {
   searchMusic,
   getTrendingMusic,
@@ -226,38 +227,62 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
     console.log(`📡 Streaming request for: ${videoId}`);
 
-    // Usamos play-dl para la extraccin porque maneja mejor las Cookies en formato string
-    // y tiene un sistema de bypass de 429 ms robusto.
-    const stream = await play.stream(url, {
-      quality: 2, // Calidad ms alta
-      htm: true,  // Forzar extraccin vía HTML (smula mejor un navegador)
-      ua: USER_AGENT
-    });
+    // Extraer la URL directa del audio (ms estable que play.stream() para evitar bloqueos)
+    const info = await play.video_info(url);
+    const audioFormat = info.format
+      .filter(f => f.mimeType?.includes('audio'))
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 
-    if (!stream) {
-       throw new Error('Could not extract stream from YouTube');
+    if (!audioFormat || !audioFormat.url) {
+       throw new Error('No direct entry points found for this track');
     }
 
     // Cabeceras cruciales para ExoPlayer y navegadores
-    res.setHeader('Content-Type', stream.type || 'audio/mpeg');
+    res.setHeader('Content-Type', audioFormat.mimeType || 'audio/mpeg');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     
-    // Pipe del flujo a la respuesta
-    stream.stream.pipe(res);
+    if (audioFormat.contentLength) {
+       res.setHeader('Content-Length', audioFormat.contentLength);
+    }
 
-    stream.stream.on('error', (err) => {
-      console.error('❌ Stream error:', err.message);
+    // Pipe manual usando el protocolo HTTPS para evitar el overhead del agente de play-dl
+    const options = {
+       headers: {
+          'User-Agent': USER_AGENT,
+          'Cookie': process.env.YOUTUBE_COOKIE || ''
+       }
+    };
+
+    https.get(audioFormat.url, options, (stream) => {
+      if (stream.statusCode && stream.statusCode >= 400) {
+         console.error(`❌ YouTube rejected stream: ${stream.statusCode}`);
+         if (!res.headersSent) res.status(stream.statusCode).end();
+         return;
+      }
+
+      stream.pipe(res);
+
+      stream.on('error', (err) => {
+        console.error('❌ Pipe error:', err.message);
+        if (!res.headersSent) res.status(500).end();
+      });
+    }).on('error', (err) => {
+      console.error('❌ Request error:', err.message);
       if (!res.headersSent) res.status(500).end();
     });
 
     req.on('close', () => {
-      // Liberar recursos
+      // Conexin cerrada por el cliente
     });
 
   } catch (error: any) {
     console.error('❌ Stream proxy error:', error.message);
-    if (!res.headersSent) res.status(500).json({ error: error.message });
+    if (!res.headersSent) {
+       // Si es un 429, devolvemos un mensaje claro en lugar de dejar que el cliente espere
+       const status = error.message.includes('429') ? 429 : 500;
+       res.status(status).json({ error: error.message });
+    }
   }
 });
 
