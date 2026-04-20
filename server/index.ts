@@ -7,6 +7,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import play from 'play-dl';
+import ytdl from '@distube/ytdl-core';
 import {
   searchMusic,
   getTrendingMusic,
@@ -221,28 +222,57 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
 
     const url = `https://www.youtube.com/watch?v=${videoId}`;
+    console.log(`📡 Streaming request for: ${videoId}`);
+
+    // Configuracin de streaming con ytdl-core (ms estable para audio continuo)
+    const options: any = {
+      filter: 'audioonly',
+      quality: 'highestaudio',
+      highWaterMark: 1 << 25, // Buffer de 32MB para evitar cortes
+    };
+
+    // Usar Cookies si estn disponibles para evitar bloqueos
+    if (process.env.YOUTUBE_COOKIE) {
+      options.requestOptions = {
+        headers: {
+          cookie: process.env.YOUTUBE_COOKIE
+        }
+      };
+    }
+
+    const info = await ytdl.getInfo(url);
+    const audioFormat = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
+
+    if (!audioFormat) {
+       throw new Error('No suitable audio format found');
+    }
+
+    // Cabeceras cruciales para ExoPlayer y navegadores
+    res.setHeader('Content-Type', audioFormat.mimeType || 'audio/mpeg');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     
-    // play-dl stream() es el mtodo ms robusto (usado en bots y apps open-source)
-    // Se encarga de las redirecciones y tokens de YouTube automticamente.
-    const stream = await play.stream(url, {
-      quality: 2 // Calidad ms alta de audio
-    });
+    // Si conocemos el tamao, lo pasamos para que el reproductor sepa la duracin total
+    if (audioFormat.contentLength) {
+       res.setHeader('Content-Length', audioFormat.contentLength);
+    }
 
-    // Establecer cabeceras para que el reproductor lo trate como un flujo infinito
-    res.setHeader('Content-Type', stream.type || 'audio/webm');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Transfer-Encoding', 'chunked');
+    // Pipe del flujo a la respuesta
+    const stream = ytdl(url, options);
+    stream.pipe(res);
 
-    // Pipe directo del flujo de play-dl a la respuesta de Express
-    stream.stream.pipe(res);
-
-    stream.stream.on('error', (err) => {
-      console.error('Piping error:', err);
+    stream.on('error', (err) => {
+      console.error('❌ Stream error:', err.message);
       if (!res.headersSent) res.status(500).end();
     });
 
+    req.on('close', () => {
+      // Importante: detener la extraccin si el usuario cierra la conexin
+      if (stream.destroy) stream.destroy();
+    });
+
   } catch (error: any) {
-    console.error('Stream proxy error:', error.message);
+    console.error('❌ Stream proxy error:', error.message);
     if (!res.headersSent) res.status(500).json({ error: error.message });
   }
 });
