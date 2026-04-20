@@ -210,9 +210,6 @@ app.get('/api/genres', async (_req, res) => {
   }
 });
 
-import youtubedl from 'youtube-dl-exec';
-
-// ... 
 /**
  * GET /api/stream/audio/:videoId
  * Specialized streaming proxy for ExoPlayer/HTML5 Audio
