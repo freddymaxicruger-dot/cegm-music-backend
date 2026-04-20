@@ -20,6 +20,16 @@ import {
 
 dotenv.config();
 
+// Configurar Cookies de YouTube para evitar deteccin de bots (Necesario en Render)
+if (process.env.YOUTUBE_COOKIE) {
+  play.setToken({
+    youtube: {
+      cookie: process.env.YOUTUBE_COOKIE
+    }
+  });
+  console.log('YouTube cookies loaded successfully');
+}
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
