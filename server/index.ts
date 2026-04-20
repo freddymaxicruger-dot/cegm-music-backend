@@ -232,6 +232,7 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     const stream = await play.stream(url, {
       quality: 2, // Calidad ms alta
       htm: true,  // Forzar extraccin vía HTML (smula mejor un navegador)
+      ua: USER_AGENT
     });
 
     if (!stream) {
