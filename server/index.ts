@@ -7,7 +7,6 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import play from 'play-dl';
-import ytdl from '@distube/ytdl-core';
 import {
   searchMusic,
   getTrendingMusic,
