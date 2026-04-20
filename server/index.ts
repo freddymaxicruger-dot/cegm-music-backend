@@ -214,41 +214,25 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
 
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const info = await play.video_info(url);
     
-    // play-dl no tiene choose_format, filtramos manualmente los formatos de audio
-    const format = info.format
-      .filter(f => f.mimeType?.includes('audio'))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    // play-dl stream() es el mtodo ms robusto (usado en bots y apps open-source)
+    // Se encarga de las redirecciones y tokens de YouTube automticamente.
+    const stream = await play.stream(url, {
+      quality: 2 // Calidad ms alta de audio
+    });
 
-    if (!format || !format.url) {
-      return res.status(500).json({ error: 'Could not extract audio format' });
-    }
+    // Establecer cabeceras para que el reproductor lo trate como un flujo infinito
+    res.setHeader('Content-Type', stream.type || 'audio/webm');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Transfer-Encoding', 'chunked');
 
-    const streamUrl = format.url;
-    
-    // Configurar el streaming con soporte para Range (vital para ExoPlayer)
-    const range = req.headers.range;
-    
-    if (range) {
-      // Proxy con Range support
-      https.get(streamUrl, { headers: { range } }, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode || 206, proxyRes.headers);
-        proxyRes.pipe(res);
-      }).on('error', (e) => {
-        console.error('Proxy Stream Error:', e);
-        if (!res.headersSent) res.status(500).end();
-      });
-    } else {
-      // Proxy standard
-      https.get(streamUrl, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-        proxyRes.pipe(res);
-      }).on('error', (e) => {
-        console.error('Proxy Stream Error:', e);
-        if (!res.headersSent) res.status(500).end();
-      });
-    }
+    // Pipe directo del flujo de play-dl a la respuesta de Express
+    stream.stream.pipe(res);
+
+    stream.stream.on('error', (err) => {
+      console.error('Piping error:', err);
+      if (!res.headersSent) res.status(500).end();
+    });
 
   } catch (error: any) {
     console.error('Stream proxy error:', error.message);
