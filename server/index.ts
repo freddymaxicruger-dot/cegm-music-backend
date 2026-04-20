@@ -31,6 +31,9 @@ if (process.env.YOUTUBE_COOKIE) {
   console.log('YouTube cookies loaded successfully');
 }
 
+// Configurar un User-Agent global para Play-DL
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -227,7 +230,8 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
     // Usamos play-dl para la extraccin porque maneja mejor las Cookies en formato string
     // y tiene un sistema de bypass de 429 ms robusto.
     const stream = await play.stream(url, {
-      quality: 2 // Calidad ms alta
+      quality: 2, // Calidad ms alta
+      htm: true,  // Forzar extraccin vía HTML (smula mejor un navegador)
     });
 
     if (!stream) {
