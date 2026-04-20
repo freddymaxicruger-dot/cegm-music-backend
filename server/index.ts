@@ -56,8 +56,10 @@ async function initInnertube() {
     // Usamos caché para evitar peticiones repetitivas de configuracin
     innertube = await Innertube.create({
       cache: new UniversalCache(false),
-      generate_session_locally: true
+      generate_session_locally: true,
+      retrieve_player: true
     });
+
     
     if (process.env.YOUTUBE_COOKIE) {
       try {
