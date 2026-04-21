@@ -14,10 +14,11 @@
     "express": "^4.21.2",
     "play-dl": "^1.9.7",
     "tsx": "^4.21.0",
+    "axios": "^1.7.9",
     "youtube-dl-exec": "^3.1.4",
     "typescript": "^5.8.2",
     "ytmusic-api": "^5.3.1",
-    "youtubei.js": "^14.4.0",
+    "youtubei.js": "^17.0.1",
 
     "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",

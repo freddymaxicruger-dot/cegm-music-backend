@@ -10,5 +10,7 @@ services:
         value: 20
       - key: YOUTUBE_API_KEY
         sync: false
+      - key: YOUTUBE_COOKIE
+        sync: false
       - key: PORT
         value: 3001

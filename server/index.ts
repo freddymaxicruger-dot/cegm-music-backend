@@ -1,6 +1,9 @@
 /**
- * CEGM Music Player - Backend Server
+ * CEGM Music Player - Backend Server (Render Deploy)
  * Express API server with YouTube Data API v3 integration
+ * 
+ * IMPORTANT: This file must stay in sync with the local server/index.ts
+ * for all streaming endpoints to work on the APK.
  */
 
 import express from 'express';
@@ -9,7 +12,7 @@ import { Innertube, UniversalCache } from 'youtubei.js';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import play from 'play-dl';
-// import https from 'https'; // Reemplazado por Innertube logic
+import https from 'https';
 import {
   searchMusic,
   getTrendingMusic,
@@ -23,7 +26,7 @@ import {
 
 dotenv.config();
 
-// Configurar Cookies de YouTube para evitar deteccin de bots (Necesario en Render)
+// Configurar Cookies de YouTube para evitar detección de bots (Necesario en Render)
 if (process.env.YOUTUBE_COOKIE) {
   play.setToken({
     youtube: {
@@ -48,25 +51,24 @@ process.on('unhandledRejection', (reason: any) => {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Inicializacin de Innertube (Cargado una sola vez para mayor eficiencia)
+// Inicialización de Innertube (Cargado una sola vez para mayor eficiencia)
 let innertube: Innertube | null = null;
 
 async function initInnertube() {
   try {
-    // Usamos caché para evitar peticiones repetitivas de configuracin
+    // Usamos caché para evitar peticiones repetitivas de configuración
     innertube = await Innertube.create({
       cache: new UniversalCache(false),
       generate_session_locally: true,
       retrieve_player: true
     });
 
-    
     if (process.env.YOUTUBE_COOKIE) {
       try {
         await innertube.session.signIn({
           cookie: process.env.YOUTUBE_COOKIE
         });
-        console.log('✅ Innertube: Sesin iniciada con cookies');
+        console.log('✅ Innertube: Sesión iniciada con cookies');
       } catch (signInError: any) {
         console.error('⚠️ Innertube SignIn Error:', signInError.message);
         console.log('🔄 Cayendo a modo invitado para no bloquear el arranque...');
@@ -258,58 +260,210 @@ app.get('/api/genres', async (_req, res) => {
   }
 });
 
+// ===== STREAMING ENDPOINTS =====
+
+/**
+ * Helper: Extract best audio URL using multiple strategies
+ * Tries Innertube first, then play-dl as fallback
+ * 
+ * IMPORTANT: In youtubei.js v17, format.decipher() returns a Promise<string>,
+ * and format.url may be undefined for encrypted streams.
+ */
+async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: string } | null> {
+  // Strategy 1: Innertube (preferred — supports more formats)
+  try {
+    if (!innertube) await initInnertube();
+    if (innertube) {
+      const info = await innertube.getInfo(videoId);
+      const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+      
+      if (format) {
+        let downloadUrl: string | undefined;
+        
+        // format.url may be a string or undefined
+        if (format.url) {
+          downloadUrl = String(format.url);
+        }
+        
+        // If no direct URL, decipher it (returns a Promise in v17!)
+        if (!downloadUrl) {
+          try {
+            const deciphered = await format.decipher(innertube.session.player);
+            if (deciphered) {
+              downloadUrl = String(deciphered);
+            }
+          } catch (e) {
+            console.warn('Innertube decipher failed:', (e as any)?.message);
+          }
+        }
+        
+        if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
+          console.log('✅ Innertube extracted audio URL');
+          return { url: downloadUrl, mime: format.mime_type };
+        }
+      }
+    }
+  } catch (e: any) {
+    console.warn('⚠️ Innertube strategy failed:', e.message);
+  }
+
+  // Strategy 2: play-dl (fallback — uses different extraction method)
+  try {
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const info = await play.video_info(url);
+    const format = info.format
+      .filter(f => f.mimeType?.includes('audio'))
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    
+    if (format?.url) {
+      console.log('✅ play-dl extracted audio URL');
+      return { url: String(format.url), mime: format.mimeType };
+    }
+  } catch (e: any) {
+    console.warn('⚠️ play-dl strategy failed:', e.message);
+  }
+
+  // Strategy 3: Reinitialize Innertube with fresh session and retry
+  try {
+    console.log('🔄 Reinitializing Innertube with fresh session...');
+    innertube = await Innertube.create({
+      cache: new UniversalCache(false),
+      generate_session_locally: true
+    });
+    
+    const info = await innertube.getInfo(videoId);
+    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+    
+    if (format) {
+      let downloadUrl: string | undefined;
+      
+      if (format.url) {
+        downloadUrl = String(format.url);
+      }
+      
+      if (!downloadUrl) {
+        try {
+          const deciphered = await format.decipher(innertube.session.player);
+          if (deciphered) {
+            downloadUrl = String(deciphered);
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+      
+      if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
+        console.log('✅ Fresh Innertube session extracted audio URL');
+        return { url: downloadUrl, mime: format.mime_type };
+      }
+    }
+  } catch (e: any) {
+    console.warn('⚠️ Fresh Innertube strategy failed:', e.message);
+  }
+
+  return null;
+}
+
 /**
  * GET /api/stream/audio/:videoId
- * Specialized streaming proxy for ExoPlayer/HTML5 Audio
- * Supports HTTP Range requests for seeking and fast buffering.
+ * Returns the deciphered direct audio URL as JSON.
+ * Used by the frontend to get a playable URL.
  */
 app.get('/api/stream/audio/:videoId', async (req, res) => {
   try {
     const videoId = req.params.videoId;
     if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
 
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
-    console.log(`📡 Streaming request for: ${videoId}`);
-
-    if (!innertube) {
-       await initInnertube();
-    }
-
-    if (!innertube) {
-       throw new Error('Streaming engine not initialized');
-    }
-
-    // Obtenemos la informacin del video usando la API interna "Innertube"
-    const info = await innertube.getInfo(videoId);
+    console.log(`📡 Stream URL request for: ${videoId}`);
     
-    // Filtramos para obtener el mejor formato de audio
-    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
-
-    if (!format) {
-       throw new Error('No valid audio format found');
-    }
-
-    // Algunas canciones ya vienen con la URL directa, otras necesitan descifrado
-    let downloadUrl = format.url;
-    if (!downloadUrl) {
-        try {
-            downloadUrl = format.decipher(innertube.session.player);
-        } catch (e) {
-            console.error('Decipher warning:', e);
-        }
-    }
-
-    if (!downloadUrl) throw new Error('Decipher failed or no URL available');
-
-    // ¡NUEVA ARQUITECTURA!
-    // Ya no hacemos un "pipe" infinito que consume el ancho de banda
-    // de Render y dispara las alertas Anti-Bot.
-    // Simplemente le damos al Frontend la URL directa descifrada.
+    const result = await extractAudioUrl(videoId);
     
-    res.json({ url: downloadUrl, quality: format.audio_quality, mime: format.mime_type });
+    if (!result) {
+      throw new Error('All extraction strategies failed');
+    }
+
+    res.json({ url: result.url, mime: result.mime });
 
   } catch (error: any) {
-    console.error('❌ Stream proxy error:', error.message);
+    console.error('❌ Stream audio error:', error.message);
+    if (!res.headersSent) {
+       const status = error.message.includes('429') ? 429 : 500;
+       res.status(status).json({ error: error.message });
+    }
+  }
+});
+
+/**
+ * GET /api/stream/proxy/:videoId
+ * REAL audio proxy — pipes audio bytes directly through the server.
+ * This is the KEY endpoint for the APK: ExoPlayer consumes this URL directly.
+ * Supports HTTP Range requests for seeking.
+ */
+app.get('/api/stream/proxy/:videoId', async (req, res) => {
+  try {
+    const videoId = req.params.videoId;
+    if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
+
+    console.log(`🎧 Proxy stream request for: ${videoId}`);
+    
+    const result = await extractAudioUrl(videoId);
+    
+    if (!result) {
+      throw new Error('All extraction strategies failed for proxy');
+    }
+
+    // Forward the Range header from the client (ExoPlayer uses this for seeking)
+    const rangeHeader = req.headers.range;
+    const headers: Record<string, string> = {
+      'User-Agent': USER_AGENT,
+    };
+    if (rangeHeader) {
+      headers['Range'] = rangeHeader;
+    }
+
+    // Fetch the audio from YouTube and pipe it to the client
+    const audioResponse = await axios.get(result.url, {
+      headers,
+      responseType: 'stream',
+      timeout: 30000,
+      // Don't validate status because 206 (Partial Content) is valid
+      validateStatus: (status) => status >= 200 && status < 400,
+    });
+
+    // Forward important headers to the client
+    const contentType = result.mime || audioResponse.headers['content-type'] || 'audio/webm';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    if (audioResponse.headers['content-length']) {
+      res.setHeader('Content-Length', audioResponse.headers['content-length']);
+    }
+    if (audioResponse.headers['content-range']) {
+      res.setHeader('Content-Range', audioResponse.headers['content-range']);
+    }
+
+    // Use the same status code (200 or 206 for Range)
+    res.status(audioResponse.status);
+
+    // Pipe the audio stream to the response
+    audioResponse.data.pipe(res);
+
+    audioResponse.data.on('error', (err: any) => {
+      console.error('Proxy pipe error:', err.message);
+      if (!res.headersSent) res.status(500).end();
+    });
+
+    // Clean up on client disconnect
+    req.on('close', () => {
+      if (audioResponse.data && typeof audioResponse.data.destroy === 'function') {
+        audioResponse.data.destroy();
+      }
+    });
+
+  } catch (error: any) {
+    console.error('❌ Proxy stream error:', error.message);
     if (!res.headersSent) {
        const status = error.message.includes('429') ? 429 : 500;
        res.status(status).json({ error: error.message });
@@ -319,20 +473,15 @@ app.get('/api/stream/audio/:videoId', async (req, res) => {
 
 /**
  * GET /api/stream/:videoId
- * Original endpoint for compatibility - still returns direct URL if needed
+ * Legacy endpoint for compatibility
  */
 app.get('/api/stream/:videoId', async (req, res) => {
-  // ... (existing logic kept for compat)
   try {
     const videoId = req.params.videoId;
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const info = await play.video_info(url);
-    const format = info.format
-      .filter(f => f.mimeType?.includes('audio'))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
     
-    if (format && format.url) {
-      res.json({ url: format.url });
+    const result = await extractAudioUrl(videoId);
+    if (result) {
+      res.json({ url: result.url });
     } else {
       res.status(500).json({ error: 'Extraction failed' });
     }
@@ -340,8 +489,6 @@ app.get('/api/stream/:videoId', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-import https from 'https';
 
 /**
  * GET /api/download/:videoId
@@ -400,7 +547,9 @@ app.get('/api/health', (_req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    hasApiKey: !!process.env.YOUTUBE_API_KEY 
+    hasApiKey: !!process.env.YOUTUBE_API_KEY,
+    hasCookies: !!process.env.YOUTUBE_COOKIE,
+    innertubeReady: !!innertube,
   });
 });
 
@@ -408,6 +557,7 @@ app.get('/api/health', (_req, res) => {
 app.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`\n🎵 CEGM Music Server running on http://localhost:${PORT}`);
   console.log(`📡 YouTube API Key: ${process.env.YOUTUBE_API_KEY ? '✅ Configured' : '❌ Missing'}`);
+  console.log(`🍪 YouTube Cookies: ${process.env.YOUTUBE_COOKIE ? '✅ Configured' : '❌ Missing'}`);
   console.log(`\nEndpoints:`);
   console.log(`  GET /api/search?q=<query>`);
   console.log(`  GET /api/trending`);
@@ -418,6 +568,9 @@ app.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`  GET /api/playlists/search?q=<query>`);
   console.log(`  GET /api/playlist/:id/items`);
   console.log(`  GET /api/genres`);
-  console.log(`  GET /api/stream/:videoId`);
+  console.log(`  GET /api/stream/audio/:videoId  (Deciphered URL)`);
+  console.log(`  GET /api/stream/proxy/:videoId  (Audio proxy for APK)`);
+  console.log(`  GET /api/stream/:videoId        (Legacy)`);
+  console.log(`  GET /api/download/:videoId`);
   console.log(`  GET /api/health\n`);
 });
