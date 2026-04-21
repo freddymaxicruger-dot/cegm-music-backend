@@ -19,7 +19,7 @@
     "typescript": "^5.8.2",
     "ytmusic-api": "^5.3.1",
     "youtubei.js": "^17.0.1",
-    "youtube-po-token-generator": "^2.0.0",
+    "youtube-po-token-generator": "^0.6.0",
 
     "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",
