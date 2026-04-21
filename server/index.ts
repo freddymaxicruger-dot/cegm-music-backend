@@ -334,45 +334,55 @@ app.get('/api/genres', async (_req, res) => {
   }
 });
 
-// ===== STREAMING ENDPOINTS =====
+/**
+ * Helper: wrap a promise with a timeout
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
 
 /**
  * Helper: Extract best audio URL using multiple strategies
- * Tries Innertube first, then play-dl as fallback
- * 
- * IMPORTANT: In youtubei.js v17, format.decipher() returns a Promise<string>,
- * and format.url may be undefined for encrypted streams.
+ * Each strategy has a tight timeout to fit within Render's 30s gateway limit.
  */
 async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: string } | null> {
-  // Strategy 1: Innertube (preferred — supports more formats)
+  const startTime = Date.now();
+  
+  // Strategy 1: Innertube (preferred — 10s timeout)
   try {
     if (!innertube) await initInnertube();
     if (innertube) {
-      const info = await innertube.getInfo(videoId);
+      const info = await withTimeout(innertube.getInfo(videoId), 10000, 'Innertube getInfo');
       const format = info.chooseFormat({ type: 'audio', quality: 'best' });
       
       if (format) {
         let downloadUrl: string | undefined;
         
-        // format.url may be a string or undefined
         if (format.url) {
           downloadUrl = String(format.url);
         }
         
-        // If no direct URL, decipher it (returns a Promise in v17!)
         if (!downloadUrl) {
           try {
-            const deciphered = await format.decipher(innertube.session.player);
-            if (deciphered) {
-              downloadUrl = String(deciphered);
-            }
+            const deciphered = await withTimeout(
+              format.decipher(innertube.session.player),
+              5000,
+              'Innertube decipher'
+            );
+            if (deciphered) downloadUrl = String(deciphered);
           } catch (e) {
             console.warn('Innertube decipher failed:', (e as any)?.message);
           }
         }
         
         if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
-          console.log('✅ Innertube extracted audio URL');
+          console.log(`✅ Innertube extracted audio URL (${Date.now() - startTime}ms)`);
           return { url: downloadUrl, mime: format.mime_type };
         }
       }
@@ -381,29 +391,34 @@ async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: s
     console.warn('⚠️ Innertube strategy failed:', e.message);
   }
 
-  // Strategy 2: play-dl (fallback — uses different extraction method)
+  // Strategy 2: play-dl (fallback — 8s timeout)
   try {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const info = await play.video_info(url);
+    const info = await withTimeout(play.video_info(url), 8000, 'play-dl video_info');
     const format = info.format
       .filter(f => f.mimeType?.includes('audio'))
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
     
     if (format?.url) {
-      console.log('✅ play-dl extracted audio URL');
+      console.log(`✅ play-dl extracted audio URL (${Date.now() - startTime}ms)`);
       return { url: String(format.url), mime: format.mimeType };
     }
   } catch (e: any) {
     console.warn('⚠️ play-dl strategy failed:', e.message);
   }
 
-  // Strategy 3: Reinitialize Innertube with fresh PO token and retry
+  // Strategy 3: Fresh Innertube + PO token (only if we have time left — 8s timeout)
+  const elapsed = Date.now() - startTime;
+  if (elapsed > 20000) {
+    console.warn('⚠️ Skipping Strategy 3 — already used ' + elapsed + 'ms');
+    return null;
+  }
+
   try {
     console.log('🔄 Reinitializing Innertube with fresh PO token...');
     
-    // Force refresh PO token
     poTokenTimestamp = 0;
-    await refreshPOToken();
+    await withTimeout(refreshPOToken(), 5000, 'PO Token refresh');
     
     const freshConfig: any = {
       cache: new UniversalCache(false),
@@ -416,16 +431,13 @@ async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: s
       freshConfig.visitor_data = cachedVisitorData;
     }
     
-    innertube = await Innertube.create(freshConfig);
+    innertube = await withTimeout(Innertube.create(freshConfig), 5000, 'Fresh Innertube create');
     
-    // Also sign in with cookies if available
     if (process.env.YOUTUBE_COOKIE && innertube) {
-      try {
-        await innertube.session.signIn({ cookie: process.env.YOUTUBE_COOKIE });
-      } catch (e) { /* ignore */ }
+      try { await innertube.session.signIn({ cookie: process.env.YOUTUBE_COOKIE }); } catch (e) { /* ignore */ }
     }
     
-    const info = await innertube.getInfo(videoId);
+    const info = await withTimeout(innertube.getInfo(videoId), 8000, 'Fresh Innertube getInfo');
     const format = info.chooseFormat({ type: 'audio', quality: 'best' });
     
     if (format) {
@@ -437,17 +449,17 @@ async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: s
       
       if (!downloadUrl) {
         try {
-          const deciphered = await format.decipher(innertube.session.player);
-          if (deciphered) {
-            downloadUrl = String(deciphered);
-          }
-        } catch (e) {
-          // ignore
-        }
+          const deciphered = await withTimeout(
+            format.decipher(innertube.session.player),
+            5000,
+            'Fresh decipher'
+          );
+          if (deciphered) downloadUrl = String(deciphered);
+        } catch (e) { /* ignore */ }
       }
       
       if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
-        console.log('✅ Fresh Innertube+PO session extracted audio URL');
+        console.log(`✅ Fresh Innertube+PO extracted URL (${Date.now() - startTime}ms)`);
         return { url: downloadUrl, mime: format.mime_type };
       }
     }
@@ -455,6 +467,7 @@ async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: s
     console.warn('⚠️ Fresh Innertube+PO strategy failed:', e.message);
   }
 
+  console.error(`❌ All strategies failed for ${videoId} (${Date.now() - startTime}ms)`);
   return null;
 }
 
