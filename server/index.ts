@@ -13,6 +13,18 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import play from 'play-dl';
 import https from 'https';
+
+// PO Token generator — required to bypass YouTube bot detection on datacenter IPs
+let generatePOToken: any;
+try {
+  const poModule = await import('youtube-po-token-generator');
+  generatePOToken = poModule.generate || poModule.default?.generate;
+  if (generatePOToken) console.log('✅ PO Token generator loaded');
+  else console.warn('⚠️ PO Token generator: generate function not found');
+} catch (e: any) {
+  console.warn('⚠️ PO Token generator not available:', e.message);
+  generatePOToken = null;
+}
 import {
   searchMusic,
   getTrendingMusic,
@@ -53,15 +65,58 @@ const PORT = process.env.PORT || 3001;
 
 // Inicialización de Innertube (Cargado una sola vez para mayor eficiencia)
 let innertube: Innertube | null = null;
+let cachedPOToken: string | null = null;
+let cachedVisitorData: string | null = null;
+let poTokenTimestamp: number = 0;
+const PO_TOKEN_REFRESH_MS = 30 * 60 * 1000; // Refresh PO token every 30 min
+
+/**
+ * Generate fresh PO Token and visitorData for YouTube authentication
+ */
+async function refreshPOToken(): Promise<void> {
+  if (!generatePOToken) return;
+  
+  const now = Date.now();
+  if (cachedPOToken && (now - poTokenTimestamp) < PO_TOKEN_REFRESH_MS) {
+    return; // Still fresh
+  }
+  
+  try {
+    console.log('🔑 Generating fresh PO Token...');
+    const result = await generatePOToken();
+    if (result?.poToken && result?.visitorData) {
+      cachedPOToken = result.poToken;
+      cachedVisitorData = result.visitorData;
+      poTokenTimestamp = now;
+      console.log('✅ PO Token generated successfully');
+    } else {
+      console.warn('⚠️ PO Token generator returned empty result');
+    }
+  } catch (e: any) {
+    console.error('⚠️ PO Token generation failed:', e.message);
+  }
+}
 
 async function initInnertube() {
   try {
-    // Usamos caché para evitar peticiones repetitivas de configuración
-    innertube = await Innertube.create({
+    // Generate PO token first (needed for datacenter IPs)
+    await refreshPOToken();
+    
+    // Build Innertube config
+    const config: any = {
       cache: new UniversalCache(false),
       generate_session_locally: true,
       retrieve_player: true
-    });
+    };
+    
+    // Add PO token if available
+    if (cachedPOToken && cachedVisitorData) {
+      config.po_token = cachedPOToken;
+      config.visitor_data = cachedVisitorData;
+      console.log('🔑 Innertube: Using PO Token for authentication');
+    }
+    
+    innertube = await Innertube.create(config);
 
     if (process.env.YOUTUBE_COOKIE) {
       try {
@@ -82,6 +137,18 @@ async function initInnertube() {
 }
 
 initInnertube();
+
+// Refresh PO token periodically
+setInterval(async () => {
+  try {
+    await refreshPOToken();
+    // Reinit Innertube with fresh token
+    await initInnertube();
+    console.log('🔄 Innertube refreshed with new PO Token');
+  } catch (e: any) {
+    console.error('PO Token refresh error:', e.message);
+  }
+}, PO_TOKEN_REFRESH_MS);
 
 // Middleware
 app.use(cors());
@@ -323,13 +390,33 @@ async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: s
     console.warn('⚠️ play-dl strategy failed:', e.message);
   }
 
-  // Strategy 3: Reinitialize Innertube with fresh session and retry
+  // Strategy 3: Reinitialize Innertube with fresh PO token and retry
   try {
-    console.log('🔄 Reinitializing Innertube with fresh session...');
-    innertube = await Innertube.create({
+    console.log('🔄 Reinitializing Innertube with fresh PO token...');
+    
+    // Force refresh PO token
+    poTokenTimestamp = 0;
+    await refreshPOToken();
+    
+    const freshConfig: any = {
       cache: new UniversalCache(false),
-      generate_session_locally: true
-    });
+      generate_session_locally: true,
+      retrieve_player: true
+    };
+    
+    if (cachedPOToken && cachedVisitorData) {
+      freshConfig.po_token = cachedPOToken;
+      freshConfig.visitor_data = cachedVisitorData;
+    }
+    
+    innertube = await Innertube.create(freshConfig);
+    
+    // Also sign in with cookies if available
+    if (process.env.YOUTUBE_COOKIE && innertube) {
+      try {
+        await innertube.session.signIn({ cookie: process.env.YOUTUBE_COOKIE });
+      } catch (e) { /* ignore */ }
+    }
     
     const info = await innertube.getInfo(videoId);
     const format = info.chooseFormat({ type: 'audio', quality: 'best' });
@@ -353,12 +440,12 @@ async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: s
       }
       
       if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
-        console.log('✅ Fresh Innertube session extracted audio URL');
+        console.log('✅ Fresh Innertube+PO session extracted audio URL');
         return { url: downloadUrl, mime: format.mime_type };
       }
     }
   } catch (e: any) {
-    console.warn('⚠️ Fresh Innertube strategy failed:', e.message);
+    console.warn('⚠️ Fresh Innertube+PO strategy failed:', e.message);
   }
 
   return null;
@@ -550,6 +637,8 @@ app.get('/api/health', (_req, res) => {
     hasApiKey: !!process.env.YOUTUBE_API_KEY,
     hasCookies: !!process.env.YOUTUBE_COOKIE,
     innertubeReady: !!innertube,
+    hasPOToken: !!cachedPOToken,
+    poTokenAge: cachedPOToken ? Math.round((Date.now() - poTokenTimestamp) / 1000) + 's' : 'N/A',
   });
 });
 
