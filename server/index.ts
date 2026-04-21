@@ -15,15 +15,18 @@ import play from 'play-dl';
 import https from 'https';
 
 // PO Token generator — required to bypass YouTube bot detection on datacenter IPs
-let generatePOToken: any;
-try {
-  const poModule = await import('youtube-po-token-generator');
-  generatePOToken = poModule.generate || poModule.default?.generate;
-  if (generatePOToken) console.log('✅ PO Token generator loaded');
-  else console.warn('⚠️ PO Token generator: generate function not found');
-} catch (e: any) {
-  console.warn('⚠️ PO Token generator not available:', e.message);
-  generatePOToken = null;
+let generatePOToken: any = null;
+
+async function loadPOTokenGenerator() {
+  try {
+    const poModule = await import('youtube-po-token-generator');
+    generatePOToken = poModule.generate || poModule.default?.generate || poModule.default;
+    if (generatePOToken) console.log('✅ PO Token generator loaded');
+    else console.warn('⚠️ PO Token generator: generate function not found');
+  } catch (e: any) {
+    console.warn('⚠️ PO Token generator not available:', e.message);
+    generatePOToken = null;
+  }
 }
 import {
   searchMusic,
@@ -74,6 +77,10 @@ const PO_TOKEN_REFRESH_MS = 30 * 60 * 1000; // Refresh PO token every 30 min
  * Generate fresh PO Token and visitorData for YouTube authentication
  */
 async function refreshPOToken(): Promise<void> {
+  // Lazy-load the PO token generator module
+  if (!generatePOToken) {
+    await loadPOTokenGenerator();
+  }
   if (!generatePOToken) return;
   
   const now = Date.now();
