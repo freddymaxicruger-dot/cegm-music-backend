@@ -1,9 +1,19 @@
 import express from 'express';
 import cors from 'cors';
 import axios from 'axios';
+import { Innertube } from 'youtubei.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Global Innertube instance
+let youtube: any;
+Innertube.create().then(it => {
+  youtube = it;
+  console.log('✅ YouTubei.js (InnerTube) initialized');
+}).catch(err => {
+  console.error('❌ Failed to initialize YouTubei.js:', err);
+});
 
 app.use(cors());
 app.use(express.json());
@@ -195,32 +205,28 @@ app.get('/api/genres', (req, res) => {
   });
 });
 
-// 10. Streaming Proxy (Pipes audio directly)
+// 10. Streaming Redirect (Better than proxy for Render/Bandwidth)
 app.get('/api/stream/proxy/:id', async (req, res) => {
   try {
-    const data = await fetchInvidious(`/api/v1/videos/${req.params.id}`);
-    let audio = data.adaptiveFormats
-      ?.filter((f: any) => f.type && f.type.includes('audio'))
-      ?.sort((a: any, b: any) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
-
-    if (!audio) {
-      audio = data.formatStreams?.filter((f: any) => f.type && f.type.includes('audio'))[0];
-    }
-
-    if (!audio?.url) return res.status(404).send('No stream');
-
-    const stream = await axios.get(audio.url, { 
-      responseType: 'stream', 
-      headers: { 
-        'User-Agent': 'Mozilla/5.0',
-        'Referer': 'https://www.youtube.com/'
-      } 
-    });
+    if (!youtube) return res.status(503).send('YouTube service initializing...');
     
-    res.setHeader('Content-Type', audio.container === 'm4a' ? 'audio/mp4' : 'audio/webm');
-    stream.data.pipe(res);
-  } catch (e: any) {
-    res.status(500).send(e.message);
+    const videoId = req.params.id;
+    // Android client usually gets more direct links
+    const info = await youtube.getBasicInfo(videoId, 'ANDROID');
+    
+    // Pick the best audio-only format
+    const format = info.streaming_data?.adaptive_formats
+      ?.filter((f: any) => f.mime_type.includes('audio'))
+      ?.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+    const url = format?.url;
+    if (!url) throw new Error('No audio found');
+
+    console.log(`[Stream] Redirecting ${videoId} to Google CDN`);
+    res.redirect(url);
+  } catch (error) {
+    console.error('[YouTubei Error]', error);
+    res.status(500).send('Error obtaining stream link');
   }
 });
 
