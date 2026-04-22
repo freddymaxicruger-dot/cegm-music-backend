@@ -199,9 +199,13 @@ app.get('/api/genres', (req, res) => {
 app.get('/api/stream/proxy/:id', async (req, res) => {
   try {
     const data = await fetchInvidious(`/api/v1/videos/${req.params.id}`);
-    const audio = data.adaptiveFormats
-      ?.filter((f: any) => f.type.includes('audio'))
-      ?.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    let audio = data.adaptiveFormats
+      ?.filter((f: any) => f.type && f.type.includes('audio'))
+      ?.sort((a: any, b: any) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
+
+    if (!audio) {
+      audio = data.formatStreams?.filter((f: any) => f.type && f.type.includes('audio'))[0];
+    }
 
     if (!audio?.url) return res.status(404).send('No stream');
 
@@ -230,9 +234,13 @@ app.get('/api/stream/audio/:id', (req, res) => {
 app.get('/api/download/:id', async (req, res) => {
   try {
     const data = await fetchInvidious(`/api/v1/videos/${req.params.id}`);
-    const audio = data.adaptiveFormats
-      ?.filter((f: any) => f.type.includes('audio'))
-      ?.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    let audio = data.adaptiveFormats
+      ?.filter((f: any) => f.type && f.type.includes('audio'))
+      ?.sort((a: any, b: any) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
+
+    if (!audio) {
+      audio = data.formatStreams?.filter((f: any) => f.type && f.type.includes('audio'))[0];
+    }
 
     if (!audio?.url) return res.status(404).send('No stream');
 
