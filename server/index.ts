@@ -54,7 +54,7 @@ app.get('/api/search', async (req, res) => {
     res.json({ results: tracks });
   } catch (error: any) {
     console.error('Search error:', error.message);
-    res.status(500).json({ error: 'Search failed' });
+    res.status(500).json({ error: 'Search failed', details: error.message });
   }
 });
 
