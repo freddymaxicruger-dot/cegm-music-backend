@@ -14,20 +14,76 @@ import dotenv from 'dotenv';
 import play from 'play-dl';
 import https from 'https';
 
-// PO Token generator — required to bypass YouTube bot detection on datacenter IPs
-let generatePOToken: any = null;
+import { exec } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-async function loadPOTokenGenerator() {
-  try {
-    const poModule = await import('youtube-po-token-generator');
-    generatePOToken = poModule.generate || poModule.default?.generate || poModule.default;
-    if (generatePOToken) console.log('✅ PO Token generator loaded');
-    else console.warn('⚠️ PO Token generator: generate function not found');
-  } catch (e: any) {
-    console.warn('⚠️ PO Token generator not available:', e.message);
-    generatePOToken = null;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// PO Token globals
+let innertube: Innertube | null = null;
+let cachedPOToken: string = '';
+let cachedVisitorData: string = '';
+let poTokenTimestamp: number = 0;
+
+async function refreshPOToken(): Promise<void> {
+  const now = Date.now();
+  // Refresh every 10 minutes or if not cached
+  if (now - poTokenTimestamp > 10 * 60 * 1000 || !cachedPOToken) {
+    return new Promise((resolve) => {
+      console.log('🔄 Generating fresh PO Token via worker...');
+      exec(`node "${path.join(__dirname, 'poWorker.js')}"`, (error, stdout) => {
+        if (error) {
+          console.warn('⚠️ PO Token worker error:', error.message);
+          resolve();
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          if (result && result.poToken && result.visitorData) {
+            cachedPOToken = result.poToken;
+            cachedVisitorData = result.visitorData;
+            poTokenTimestamp = now;
+            console.log('✅ PO Token generated and cached successfully');
+          }
+        } catch (e: any) {
+          console.warn('⚠️ PO Token parse error:', e.message);
+        }
+        resolve();
+      });
+    });
   }
 }
+
+async function initInnertube() {
+  if (innertube) return;
+  await refreshPOToken();
+  
+  const config: any = {
+    cache: new UniversalCache(false),
+    generate_session_locally: true,
+    retrieve_player: true
+  };
+  
+  if (cachedPOToken && cachedVisitorData) {
+    config.po_token = cachedPOToken;
+    config.visitor_data = cachedVisitorData;
+  }
+  
+  innertube = await Innertube.create(config);
+  if (process.env.YOUTUBE_COOKIE) {
+    try {
+      await innertube.session.signIn({ cookie: process.env.YOUTUBE_COOKIE });
+      console.log('✅ Innertube signed in with YOUTUBE_COOKIE');
+    } catch (e: any) {
+      console.warn('⚠️ Innertube SignIn Error:', e.message);
+    }
+  }
+}
+
+// Ensure Innertube initializes on boot
+initInnertube().catch(console.error);
 import {
   searchMusic,
   getTrendingMusic,
@@ -62,111 +118,7 @@ process.on('uncaughtException', (err) => {
 // SELF PING - KEEP ALIVE PARA RENDER
 // Esto engaña a Render para que crea que hay tráfico externo y no "duerma" la app.
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://cegm-music-backend.onrender.com';
-setInterval(() => {
-  https.get(`${RENDER_URL}/api/health`, (res) => {
-    console.log(`[Keep-Alive] Ping enviado a ${RENDER_URL} - Status: ${res.statusCode}`);
-  }).on('error', (e) => {
-    console.error(`[Keep-Alive] Error en el ping: ${e.message}`);
-  });
-}, 10 * 60 * 1000); // Cada 10 minutos
 
-process.on('unhandledRejection', (reason: any) => {
-  console.error('🔥 CRITICAL: Unhandled Rejection:', reason?.message || reason);
-});
-
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Inicialización de Innertube (Cargado una sola vez para mayor eficiencia)
-let innertube: Innertube | null = null;
-let cachedPOToken: string | null = null;
-let cachedVisitorData: string | null = null;
-let poTokenTimestamp: number = 0;
-const PO_TOKEN_REFRESH_MS = 30 * 60 * 1000; // Refresh PO token every 30 min
-
-/**
- * Generate fresh PO Token and visitorData for YouTube authentication
- */
-async function refreshPOToken(): Promise<void> {
-  // Lazy-load the PO token generator module
-  if (!generatePOToken) {
-    await loadPOTokenGenerator();
-  }
-  if (!generatePOToken) return;
-  
-  const now = Date.now();
-  if (cachedPOToken && (now - poTokenTimestamp) < PO_TOKEN_REFRESH_MS) {
-    return; // Still fresh
-  }
-  
-  try {
-    console.log('🔑 Generating fresh PO Token...');
-    const result = await generatePOToken();
-    if (result?.poToken && result?.visitorData) {
-      cachedPOToken = result.poToken;
-      cachedVisitorData = result.visitorData;
-      poTokenTimestamp = now;
-      console.log('✅ PO Token generated successfully');
-    } else {
-      console.warn('⚠️ PO Token generator returned empty result');
-    }
-  } catch (e: any) {
-    console.error('⚠️ PO Token generation failed:', e.message);
-  }
-}
-
-async function initInnertube() {
-  try {
-    // Generate PO token first (needed for datacenter IPs)
-    await refreshPOToken();
-    
-    // Build Innertube config
-    const config: any = {
-      cache: new UniversalCache(false),
-      generate_session_locally: true,
-      retrieve_player: true
-    };
-    
-    // Add PO token if available
-    if (cachedPOToken && cachedVisitorData) {
-      config.po_token = cachedPOToken;
-      config.visitor_data = cachedVisitorData;
-      console.log('🔑 Innertube: Using PO Token for authentication');
-    }
-    
-    innertube = await Innertube.create(config);
-
-    if (process.env.YOUTUBE_COOKIE) {
-      try {
-        await innertube.session.signIn({
-          cookie: process.env.YOUTUBE_COOKIE
-        });
-        console.log('✅ Innertube: Sesión iniciada con cookies');
-      } catch (signInError: any) {
-        console.error('⚠️ Innertube SignIn Error:', signInError.message);
-        console.log('🔄 Cayendo a modo invitado para no bloquear el arranque...');
-      }
-    } else {
-      console.log('⚠️ Innertube: Iniciado en modo invitado (sin cookies)');
-    }
-  } catch (error: any) {
-    console.error('❌ Innertube Init Error:', error.message);
-  }
-}
-
-initInnertube();
-
-// Refresh PO token periodically
-setInterval(async () => {
-  try {
-    await refreshPOToken();
-    // Reinit Innertube with fresh token
-    await initInnertube();
-    console.log('🔄 Innertube refreshed with new PO Token');
-  } catch (e: any) {
-    console.error('PO Token refresh error:', e.message);
-  }
-}, PO_TOKEN_REFRESH_MS);
 
 // Middleware
 app.use(cors());
@@ -614,20 +566,17 @@ app.get('/api/stream/proxy/:videoId', async (req, res) => {
   }
 });
 
-/**
- * GET /api/stream/:videoId
- * Legacy endpoint for compatibility
- */
 app.get('/api/stream/:videoId', async (req, res) => {
   try {
     const videoId = req.params.videoId;
+    console.log(`🎵 Extracting audio direct URL for: ${videoId} using play-dl`);
     
-    const result = await extractAudioUrl(videoId);
-    if (result) {
-      res.json({ url: result.url });
-    } else {
-      res.status(500).json({ error: 'Extraction failed' });
-    }
+    const info = await play.video_info(`https://www.youtube.com/watch?v=${videoId}`);
+    const format = info.format.find(f => f.mimeType && f.mimeType.includes('audio') && !f.mimeType.includes('video'));
+    
+    if (!format || !format.url) throw new Error('No direct audio URL found');
+    
+    res.json({ url: format.url, mime: format.mimeType });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
