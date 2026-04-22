@@ -20,8 +20,6 @@ const INVIDIOUS_INSTANCES = [
 ];
 
 let currentInstanceIndex = 0;
-const videoInfoCache = new Map<string, { data: any, timestamp: number }>();
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes cache
 
 function getNextInstance() {
   const instance = INVIDIOUS_INSTANCES[currentInstanceIndex];
@@ -29,24 +27,13 @@ function getNextInstance() {
   return instance;
 }
 
-// Helper for Invidious API requests with automatic failover and caching
-async function invidiousRequest(endpoint: string, useCache = false) {
-  const cacheKey = endpoint;
-  if (useCache && videoInfoCache.has(cacheKey)) {
-    const entry = videoInfoCache.get(cacheKey)!;
-    if (Date.now() - entry.timestamp < CACHE_TTL) {
-      return entry.data;
-    }
-  }
-
+// Helper for Invidious API requests with automatic failover
+async function invidiousRequest(endpoint: string) {
   let lastError;
   for (let i = 0; i < INVIDIOUS_INSTANCES.length; i++) {
     const instance = getNextInstance();
     try {
       const response = await axios.get(`${instance}${endpoint}`, { timeout: 8000 });
-      if (useCache) {
-        videoInfoCache.set(cacheKey, { data: response.data, timestamp: Date.now() });
-      }
       return response.data;
     } catch (error: any) {
       console.warn(`⚠️ Instance ${instance} failed: ${error.message}`);
@@ -93,7 +80,7 @@ app.get('/api/trending', async (req, res) => {
     const region = (req.query.region as string) || 'MX';
     console.log(`🔥 Fetching trending (${region})`);
     
-    const results = await invidiousRequest(`/api/v1/trending?region=${region}`, true);
+    const results = await invidiousRequest(`/api/v1/trending?region=${region}`);
     
     const tracks = results.slice(0, 20).map((v: any) => ({
       id: v.videoId,
@@ -115,7 +102,7 @@ app.get('/api/trending', async (req, res) => {
 app.get('/api/video/:id', async (req, res) => {
   try {
     const videoId = req.params.id;
-    const v = await invidiousRequest(`/api/v1/videos/${videoId}`, true);
+    const v = await invidiousRequest(`/api/v1/videos/${videoId}`);
     
     res.json({
       id: v.videoId,
@@ -139,7 +126,7 @@ app.get('/api/stream/proxy/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
     console.log(`🎵 Streaming proxy for: ${videoId}`);
     
-    const data = await invidiousRequest(`/api/v1/videos/${videoId}`, true);
+    const data = await invidiousRequest(`/api/v1/videos/${videoId}`);
     
     const audioStream = data.adaptiveFormats
       ?.filter((f: any) => f.type.includes('audio'))
