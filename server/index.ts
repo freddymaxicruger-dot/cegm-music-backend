@@ -206,34 +206,64 @@ app.get('/api/genres', (req, res) => {
   });
 });
 
-// 10. Streaming Proxy (Using YouTubei.js download)
+// 10. Ultimate Streaming Proxy (YouTubei.js -> Invidious Fallback)
 app.get('/api/stream/proxy/:id', async (req, res) => {
+  const videoId = req.params.id;
+  console.log(`[Stream] Requesting: ${videoId}`);
+
+  // Strategy 1: YouTubei.js (InnerTube)
+  if (youtube) {
+    try {
+      console.log(`[Stream] Strategy 1: YouTubei.js...`);
+      const stream = await youtube.download(videoId, {
+        type: 'audio',
+        quality: 'best',
+        format: 'mp4',
+        client: 'YTMUSIC'
+      });
+
+      const reader = stream.getReader();
+      res.setHeader('Content-Type', 'audio/mpeg');
+      
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!res.write(value)) await new Promise(resolve => res.once('drain', resolve));
+          }
+        } catch (e) { console.error('[Pump Error]', e); }
+        finally { res.end(); reader.releaseLock(); }
+      };
+      pump();
+      req.on('close', () => { reader.cancel().catch(() => {}); });
+      return; // Success!
+    } catch (err: any) {
+      console.warn(`[Stream] YouTubei.js failed: ${err.message}. Falling back to Invidious...`);
+    }
+  }
+
+  // Strategy 2: Invidious Fallback
   try {
-    if (!youtube) return res.status(503).send('YouTube service initializing...');
+    console.log(`[Stream] Strategy 2: Invidious Fallback...`);
+    const data = await fetchInvidious(`/api/v1/videos/${videoId}`);
+    let audio = data.adaptiveFormats?.filter((f: any) => f.type && f.type.includes('audio'))
+      ?.sort((a: any, b: any) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
     
-    const videoId = req.params.id;
-    console.log(`[Stream] Starting InnerTube download for ${videoId}`);
+    if (!audio) audio = data.formatStreams?.filter((f: any) => f.type && f.type.includes('audio'))[0];
     
-    const stream = await youtube.download(videoId, {
-      type: 'audio',
-      quality: 'best',
-      format: 'mp4',
-      client: 'ANDROID'
+    if (!audio?.url) throw new Error('No audio found in Invidious');
+
+    const stream = await axios.get(audio.url, {
+      responseType: 'stream',
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/' }
     });
 
     res.setHeader('Content-Type', 'audio/mpeg');
-    
-    // Efficiently pipe Web Stream to Express Response
-    const nodeStream = Readable.fromWeb(stream as any);
-    nodeStream.pipe(res);
-
-    req.on('close', () => {
-      nodeStream.destroy();
-    });
-
-  } catch (error) {
-    console.error('[YouTubei Proxy Error]', error);
-    res.status(500).send('Error in stream proxy');
+    stream.data.pipe(res);
+  } catch (error: any) {
+    console.error(`[Stream] All strategies failed for ${videoId}:`, error.message);
+    res.status(500).send('Streaming failed');
   }
 });
 
