@@ -474,25 +474,50 @@ async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: s
 /**
  * GET /api/stream/audio/:videoId
  * Returns the deciphered direct audio URL as JSON.
- * Used by the frontend to get a playable URL.
+ * FAST version — only uses the already-initialized Innertube (with PO token).
+ * If this fails, the frontend falls back to /api/stream/proxy/ automatically.
  */
 app.get('/api/stream/audio/:videoId', async (req, res) => {
   try {
     const videoId = req.params.videoId;
     if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
 
-    console.log(`📡 Stream URL request for: ${videoId}`);
+    console.log(`📡 [FAST] Stream URL request for: ${videoId}`);
+    const startTime = Date.now();
     
-    const result = await extractAudioUrl(videoId);
+    // Only try Innertube (already has PO token from boot) — 12s max
+    if (!innertube) await initInnertube();
+    if (!innertube) throw new Error('Innertube not ready');
     
-    if (!result) {
-      throw new Error('All extraction strategies failed');
+    const info = await withTimeout(innertube.getInfo(videoId), 12000, 'getInfo');
+    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+    
+    if (!format) throw new Error('No audio format found');
+    
+    let downloadUrl: string | undefined;
+    
+    if (format.url) {
+      downloadUrl = String(format.url);
     }
-
-    res.json({ url: result.url, mime: result.mime });
+    
+    if (!downloadUrl) {
+      const deciphered = await withTimeout(
+        format.decipher(innertube.session.player),
+        5000,
+        'decipher'
+      );
+      if (deciphered) downloadUrl = String(deciphered);
+    }
+    
+    if (!downloadUrl || !downloadUrl.startsWith('http')) {
+      throw new Error('Could not extract audio URL');
+    }
+    
+    console.log(`✅ [FAST] Extracted in ${Date.now() - startTime}ms`);
+    res.json({ url: downloadUrl, mime: format.mime_type });
 
   } catch (error: any) {
-    console.error('❌ Stream audio error:', error.message);
+    console.error('❌ [FAST] Stream error:', error.message);
     if (!res.headersSent) {
        const status = error.message.includes('429') ? 429 : 500;
        res.status(status).json({ error: error.message });
