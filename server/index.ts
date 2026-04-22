@@ -1,4 +1,5 @@
 import express from 'express';
+import { Readable } from 'stream';
 import cors from 'cors';
 import axios from 'axios';
 import { Innertube } from 'youtubei.js';
@@ -222,29 +223,12 @@ app.get('/api/stream/proxy/:id', async (req, res) => {
 
     res.setHeader('Content-Type', 'audio/mpeg');
     
-    // Convert ReadableStream to Node.js Readable if necessary
-    const reader = stream.getReader();
-    
-    const pump = async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!res.write(value)) {
-            await new Promise(resolve => res.once('drain', resolve));
-          }
-        }
-        res.end();
-      } catch (err) {
-        console.error('[Stream Pump Error]', err);
-        res.end();
-      }
-    };
-    
-    pump();
+    // Efficiently pipe Web Stream to Express Response
+    const nodeStream = Readable.fromWeb(stream as any);
+    nodeStream.pipe(res);
 
     req.on('close', () => {
-      reader.cancel();
+      nodeStream.destroy();
     });
 
   } catch (error) {
