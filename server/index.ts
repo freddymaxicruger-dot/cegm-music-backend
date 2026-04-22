@@ -14,7 +14,11 @@ const INSTANCES = [
   'https://invidious.flokinet.to',
   'https://inv.vern.cc',
   'https://invidious.projectsegfau.lt',
-  'https://yewtu.be'
+  'https://yewtu.be',
+  'https://invidious.nerdvpn.de',
+  'https://invidious.tiekoetter.com',
+  'https://inv.tux.pizza',
+  'https://invidious.privacydev.net'
 ];
 
 async function fetchInvidious(endpoint: string) {
