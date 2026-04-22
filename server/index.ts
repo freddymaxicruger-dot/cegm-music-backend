@@ -59,6 +59,17 @@ process.on('uncaughtException', (err) => {
   console.error('🔥 CRITICAL: Uncaught Exception:', err.message);
 });
 
+// SELF PING - KEEP ALIVE PARA RENDER
+// Esto engaña a Render para que crea que hay tráfico externo y no "duerma" la app.
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://cegm-music-backend.onrender.com';
+setInterval(() => {
+  https.get(`${RENDER_URL}/api/health`, (res) => {
+    console.log(`[Keep-Alive] Ping enviado a ${RENDER_URL} - Status: ${res.statusCode}`);
+  }).on('error', (e) => {
+    console.error(`[Keep-Alive] Error en el ping: ${e.message}`);
+  });
+}, 10 * 60 * 1000); // Cada 10 minutos
+
 process.on('unhandledRejection', (reason: any) => {
   console.error('🔥 CRITICAL: Unhandled Rejection:', reason?.message || reason);
 });
