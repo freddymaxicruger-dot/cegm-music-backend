@@ -205,28 +205,51 @@ app.get('/api/genres', (req, res) => {
   });
 });
 
-// 10. Streaming Redirect (Better than proxy for Render/Bandwidth)
+// 10. Streaming Proxy (Using YouTubei.js download)
 app.get('/api/stream/proxy/:id', async (req, res) => {
   try {
     if (!youtube) return res.status(503).send('YouTube service initializing...');
     
     const videoId = req.params.id;
-    // Android client usually gets more direct links
-    const info = await youtube.getBasicInfo(videoId, 'ANDROID');
+    console.log(`[Stream] Starting InnerTube download for ${videoId}`);
     
-    // Pick the best audio-only format
-    const format = info.streaming_data?.adaptive_formats
-      ?.filter((f: any) => f.mime_type.includes('audio'))
-      ?.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    const stream = await youtube.download(videoId, {
+      type: 'audio',
+      quality: 'best',
+      format: 'mp4',
+      client: 'ANDROID'
+    });
 
-    const url = format?.url;
-    if (!url) throw new Error('No audio found');
+    res.setHeader('Content-Type', 'audio/mpeg');
+    
+    // Convert ReadableStream to Node.js Readable if necessary
+    const reader = stream.getReader();
+    
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.write(value)) {
+            await new Promise(resolve => res.once('drain', resolve));
+          }
+        }
+        res.end();
+      } catch (err) {
+        console.error('[Stream Pump Error]', err);
+        res.end();
+      }
+    };
+    
+    pump();
 
-    console.log(`[Stream] Redirecting ${videoId} to Google CDN`);
-    res.redirect(url);
+    req.on('close', () => {
+      reader.cancel();
+    });
+
   } catch (error) {
-    console.error('[YouTubei Error]', error);
-    res.status(500).send('Error obtaining stream link');
+    console.error('[YouTubei Proxy Error]', error);
+    res.status(500).send('Error in stream proxy');
   }
 });
 
