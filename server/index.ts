@@ -521,12 +521,17 @@ app.get('/api/stream/proxy/:videoId', async (req, res) => {
       headers,
       responseType: 'stream',
       timeout: 30000,
-      // Don't validate status because 206 (Partial Content) is valid
-      validateStatus: (status) => status >= 200 && status < 400,
+      validateStatus: () => true // Allow all statuses so it doesn't throw on 403
     });
 
-    // Forward important headers to the client
-    const contentType = result.mime || audioResponse.headers['content-type'] || 'audio/webm';
+    if (audioResponse.status >= 400) {
+      console.error(`⚠️ Proxy stream received HTTP ${audioResponse.status} from YouTube`);
+      // Read the stream to flush it and prevent memory leak
+      audioResponse.data.on('data', () => {});
+      return res.status(audioResponse.status).json({ error: `YouTube returned ${audioResponse.status}` });
+    }
+
+    const contentType = result.mime || audioResponse.headers['content-type'] || 'audio/mp4';
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Access-Control-Allow-Origin', '*');
