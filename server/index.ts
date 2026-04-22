@@ -1,678 +1,170 @@
-/**
- * CEGM Music Player - Backend Server (Render Deploy)
- * Express API server with YouTube Data API v3 integration
- * 
- * IMPORTANT: This file must stay in sync with the local server/index.ts
- * for all streaming endpoints to work on the APK.
- */
-
 import express from 'express';
 import cors from 'cors';
-import { Innertube, UniversalCache } from 'youtubei.js';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import play from 'play-dl';
-import https from 'https';
-
-import { exec } from 'child_process';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// PO Token globals
-let innertube: Innertube | null = null;
-let cachedPOToken: string = '';
-let cachedVisitorData: string = '';
-let poTokenTimestamp: number = 0;
-
-async function refreshPOToken(): Promise<void> {
-  const now = Date.now();
-  // Refresh every 10 minutes or if not cached
-  if (now - poTokenTimestamp > 10 * 60 * 1000 || !cachedPOToken) {
-    return new Promise((resolve) => {
-      console.log('🔄 Generating fresh PO Token via worker...');
-      exec(`node "${path.join(__dirname, 'poWorker.js')}"`, (error, stdout) => {
-        if (error) {
-          console.warn('⚠️ PO Token worker error:', error.message);
-          resolve();
-          return;
-        }
-        try {
-          const result = JSON.parse(stdout);
-          if (result && result.poToken && result.visitorData) {
-            cachedPOToken = result.poToken;
-            cachedVisitorData = result.visitorData;
-            poTokenTimestamp = now;
-            console.log('✅ PO Token generated and cached successfully');
-          }
-        } catch (e: any) {
-          console.warn('⚠️ PO Token parse error:', e.message);
-        }
-        resolve();
-      });
-    });
-  }
-}
-
-async function initInnertube() {
-  if (innertube) return;
-  await refreshPOToken();
-
-  const config: any = {
-    cache: new UniversalCache(false),
-    generate_session_locally: true,
-    retrieve_player: true
-  };
-
-  if (cachedPOToken && cachedVisitorData) {
-    config.po_token = cachedPOToken;
-    config.visitor_data = cachedVisitorData;
-  }
-
-  innertube = await Innertube.create(config);
-  if (process.env.YOUTUBE_COOKIE) {
-    try {
-      await innertube.session.signIn({ cookie: process.env.YOUTUBE_COOKIE });
-      console.log('✅ Innertube signed in with YOUTUBE_COOKIE');
-    } catch (e: any) {
-      console.warn('⚠️ Innertube SignIn Error:', e.message);
-    }
-  }
-}
-
-// Ensure Innertube initializes on boot
-initInnertube().catch(console.error);
-import {
-  searchMusic,
-  getTrendingMusic,
-  getVideoById,
-  getRelatedVideos,
-  getChannel,
-  searchChannels,
-  getMusicPlaylists,
-  getPlaylistItems,
-} from './youtube.js';
 
 dotenv.config();
 
-// Configurar Cookies de YouTube para evitar detección de bots (Necesario en Render)
-if (process.env.YOUTUBE_COOKIE) {
-  play.setToken({
-    youtube: {
-      cookie: process.env.YOUTUBE_COOKIE
-    }
-  });
-  console.log('YouTube cookies loaded successfully');
-}
+const app = express();
+const PORT = process.env.PORT || 3001;
 
-// Configurar un User-Agent global para Play-DL
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
-// Escudo Anti-Caídas Global
-process.on('uncaughtException', (err) => {
-  console.error('🔥 CRITICAL: Uncaught Exception:', err.message);
-});
-
-// SELF PING - KEEP ALIVE PARA RENDER
-// Esto engaña a Render para que crea que hay tráfico externo y no "duerma" la app.
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://cegm-music-backend.onrender.com';
-
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// ===== API ROUTES =====
+// List of public Invidious instances for redundancy
+const INVIDIOUS_INSTANCES = [
+  'https://inv.thepixora.com',
+  'https://invidious.private.coffee',
+  'https://invidious.asir.dev',
+  'https://invidious.flokinet.to'
+];
+
+let currentInstanceIndex = 0;
+const videoInfoCache = new Map<string, { data: any, timestamp: number }>();
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutes cache
+
+function getNextInstance() {
+  const instance = INVIDIOUS_INSTANCES[currentInstanceIndex];
+  currentInstanceIndex = (currentInstanceIndex + 1) % INVIDIOUS_INSTANCES.length;
+  return instance;
+}
+
+// Helper for Invidious API requests with automatic failover and caching
+async function invidiousRequest(endpoint: string, useCache = false) {
+  const cacheKey = endpoint;
+  if (useCache && videoInfoCache.has(cacheKey)) {
+    const entry = videoInfoCache.get(cacheKey)!;
+    if (Date.now() - entry.timestamp < CACHE_TTL) {
+      return entry.data;
+    }
+  }
+
+  let lastError;
+  for (let i = 0; i < INVIDIOUS_INSTANCES.length; i++) {
+    const instance = getNextInstance();
+    try {
+      const response = await axios.get(`${instance}${endpoint}`, { timeout: 8000 });
+      if (useCache) {
+        videoInfoCache.set(cacheKey, { data: response.data, timestamp: Date.now() });
+      }
+      return response.data;
+    } catch (error: any) {
+      console.warn(`⚠️ Instance ${instance} failed: ${error.message}`);
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
 
 /**
- * GET /api/search?q=<query>&max=<maxResults>
- * Search YouTube for music videos
+ * GET /api/search
  */
 app.get('/api/search', async (req, res) => {
   try {
     const query = req.query.q as string;
     const max = parseInt(req.query.max as string) || 20;
+    
+    if (!query) return res.status(400).json({ error: 'Query is required' });
 
-    if (!query) {
-      return res.status(400).json({ error: 'Query parameter "q" is required' });
-    }
+    console.log(`🔍 Searching (Invidious): ${query}`);
+    const results = await invidiousRequest(`/api/v1/search?q=${encodeURIComponent(query)}&type=video`);
+    
+    const tracks = results.slice(0, max).map((v: any) => ({
+      id: v.videoId,
+      title: v.title,
+      artist: v.author,
+      thumbnail: v.videoThumbnails?.find((t: any) => t.quality === 'high')?.url || v.videoThumbnails?.[0]?.url,
+      duration: v.lengthSeconds ? `${Math.floor(v.lengthSeconds / 60)}:${(v.lengthSeconds % 60).toString().padStart(2, '0')}` : '0:00',
+      views: v.viewCountText || '0'
+    }));
 
-    const results = await searchMusic(query, max);
-    res.json({ results, total: results.length });
+    res.json({ results: tracks });
   } catch (error: any) {
     console.error('Search error:', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Search failed' });
   }
 });
 
 /**
- * GET /api/trending?max=<maxResults>&region=<regionCode>
- * Get trending music videos
+ * GET /api/trending
  */
 app.get('/api/trending', async (req, res) => {
   try {
-    const max = parseInt(req.query.max as string) || 20;
     const region = (req.query.region as string) || 'MX';
+    console.log(`🔥 Fetching trending (${region})`);
+    
+    const results = await invidiousRequest(`/api/v1/trending?region=${region}`, true);
+    
+    const tracks = results.slice(0, 20).map((v: any) => ({
+      id: v.videoId,
+      title: v.title,
+      artist: v.author,
+      thumbnail: v.videoThumbnails?.[0]?.url,
+      duration: v.lengthSeconds ? `${Math.floor(v.lengthSeconds / 60)}:${(v.lengthSeconds % 60).toString().padStart(2, '0')}` : '0:00'
+    }));
 
-    const results = await getTrendingMusic(max, region);
-    res.json({ results, total: results.length });
+    res.json({ results: tracks });
   } catch (error: any) {
-    console.error('Trending error:', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Trending failed' });
   }
 });
 
 /**
  * GET /api/video/:id
- * Get a single video's details
  */
 app.get('/api/video/:id', async (req, res) => {
   try {
-    const video = await getVideoById(req.params.id);
-    if (!video) {
-      return res.status(404).json({ error: 'Video not found' });
-    }
-    res.json(video);
+    const videoId = req.params.id;
+    const v = await invidiousRequest(`/api/v1/videos/${videoId}`, true);
+    
+    res.json({
+      id: v.videoId,
+      title: v.title,
+      artist: v.author,
+      thumbnail: v.videoThumbnails?.[0]?.url,
+      duration: v.lengthSeconds ? `${Math.floor(v.lengthSeconds / 60)}:${(v.lengthSeconds % 60).toString().padStart(2, '0')}` : '0:00',
+      description: v.description,
+      viewCount: v.viewCount?.toString()
+    });
   } catch (error: any) {
-    console.error('Video detail error:', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Video fetch failed' });
   }
 });
 
 /**
- * GET /api/video/:id/related?max=<maxResults>
- * Get related videos
- */
-app.get('/api/video/:id/related', async (req, res) => {
-  try {
-    const max = parseInt(req.query.max as string) || 10;
-    const results = await getRelatedVideos(req.params.id, max);
-    res.json({ results, total: results.length });
-  } catch (error: any) {
-    console.error('Related videos error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * GET /api/channel/:id
- * Get channel details
- */
-app.get('/api/channel/:id', async (req, res) => {
-  try {
-    const channel = await getChannel(req.params.id);
-    if (!channel) {
-      return res.status(404).json({ error: 'Channel not found' });
-    }
-    res.json(channel);
-  } catch (error: any) {
-    console.error('Channel error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * GET /api/channels/search?q=<query>&max=<maxResults>
- * Search for YouTube channels (artists)
- */
-app.get('/api/channels/search', async (req, res) => {
-  try {
-    const query = req.query.q as string;
-    const max = parseInt(req.query.max as string) || 10;
-
-    if (!query) {
-      return res.status(400).json({ error: 'Query parameter "q" is required' });
-    }
-
-    const results = await searchChannels(query, max);
-    res.json({ results, total: results.length });
-  } catch (error: any) {
-    console.error('Channel search error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * GET /api/playlists/search?q=<query>&max=<maxResults>
- * Search for music playlists
- */
-app.get('/api/playlists/search', async (req, res) => {
-  try {
-    const query = req.query.q as string;
-    const max = parseInt(req.query.max as string) || 6;
-
-    if (!query) {
-      return res.status(400).json({ error: 'Query parameter "q" is required' });
-    }
-
-    const results = await getMusicPlaylists(query, max);
-    res.json({ results, total: results.length });
-  } catch (error: any) {
-    console.error('Playlist search error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * GET /api/playlist/:id/items?max=<maxResults>
- * Get items from a playlist
- */
-app.get('/api/playlist/:id/items', async (req, res) => {
-  try {
-    const max = parseInt(req.query.max as string) || 25;
-    const results = await getPlaylistItems(req.params.id, max);
-    res.json({ results, total: results.length });
-  } catch (error: any) {
-    console.error('Playlist items error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * GET /api/genres
- * Get genre-based playlists for browsing
- */
-app.get('/api/genres', async (_req, res) => {
-  try {
-    const genres = ['Pop', 'Rock', 'Hip Hop', 'Electronic', 'Jazz', 'Reggaeton', 'Classical', 'R&B'];
-
-    const genreResults = await Promise.all(
-      genres.map(async (genre) => {
-        const playlists = await getMusicPlaylists(genre, 1);
-        const playlist = playlists[0];
-        return {
-          name: genre,
-          image: playlist?.thumbnail || `https://picsum.photos/seed/${genre.toLowerCase()}/200/200`,
-          playlistId: playlist?.id || null,
-        };
-      })
-    );
-
-    res.json({ genres: genreResults });
-  } catch (error: any) {
-    console.error('Genres error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * Helper: wrap a promise with a timeout
- */
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    promise.then(
-      (val) => { clearTimeout(timer); resolve(val); },
-      (err) => { clearTimeout(timer); reject(err); }
-    );
-  });
-}
-
-/**
- * Helper: Extract best audio URL using multiple strategies
- * Each strategy has a tight timeout to fit within Render's 30s gateway limit.
- */
-async function extractAudioUrl(videoId: string): Promise<{ url: string, mime?: string } | null> {
-  const startTime = Date.now();
-
-  // Strategy 1: Innertube (preferred — 10s timeout)
-  try {
-    if (!innertube) await initInnertube();
-    if (innertube) {
-      const info = await withTimeout(innertube.getInfo(videoId), 10000, 'Innertube getInfo');
-      const format = info.chooseFormat({ type: 'audio', quality: 'best' });
-
-      if (format) {
-        let downloadUrl: string | undefined;
-
-        if (format.url) {
-          downloadUrl = String(format.url);
-        }
-
-        if (!downloadUrl) {
-          try {
-            const deciphered = await withTimeout(
-              format.decipher(innertube.session.player),
-              5000,
-              'Innertube decipher'
-            );
-            if (deciphered) downloadUrl = String(deciphered);
-          } catch (e) {
-            console.warn('Innertube decipher failed:', (e as any)?.message);
-          }
-        }
-
-        if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
-          console.log(`✅ Innertube extracted audio URL (${Date.now() - startTime}ms)`);
-          return { url: downloadUrl, mime: format.mime_type };
-        }
-      }
-    }
-  } catch (e: any) {
-    console.warn('⚠️ Innertube strategy failed:', e.message);
-  }
-
-  // Strategy 2: play-dl (fallback — 8s timeout)
-  try {
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const info = await withTimeout(play.video_info(url), 8000, 'play-dl video_info');
-    const format = info.format
-      .filter(f => f.mimeType?.includes('audio'))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-
-    if (format?.url) {
-      console.log(`✅ play-dl extracted audio URL (${Date.now() - startTime}ms)`);
-      return { url: String(format.url), mime: format.mimeType };
-    }
-  } catch (e: any) {
-    console.warn('⚠️ play-dl strategy failed:', e.message);
-  }
-
-  // Strategy 3: Fresh Innertube + PO token (only if we have time left — 8s timeout)
-  const elapsed = Date.now() - startTime;
-  if (elapsed > 20000) {
-    console.warn('⚠️ Skipping Strategy 3 — already used ' + elapsed + 'ms');
-    return null;
-  }
-
-  try {
-    console.log('🔄 Reinitializing Innertube with fresh PO token...');
-
-    poTokenTimestamp = 0;
-    await withTimeout(refreshPOToken(), 5000, 'PO Token refresh');
-
-    const freshConfig: any = {
-      cache: new UniversalCache(false),
-      generate_session_locally: true,
-      retrieve_player: true
-    };
-
-    if (cachedPOToken && cachedVisitorData) {
-      freshConfig.po_token = cachedPOToken;
-      freshConfig.visitor_data = cachedVisitorData;
-    }
-
-    innertube = await withTimeout(Innertube.create(freshConfig), 5000, 'Fresh Innertube create');
-
-    if (process.env.YOUTUBE_COOKIE && innertube) {
-      try { await innertube.session.signIn({ cookie: process.env.YOUTUBE_COOKIE }); } catch (e) { /* ignore */ }
-    }
-
-    const info = await withTimeout(innertube.getInfo(videoId), 8000, 'Fresh Innertube getInfo');
-    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
-
-    if (format) {
-      let downloadUrl: string | undefined;
-
-      if (format.url) {
-        downloadUrl = String(format.url);
-      }
-
-      if (!downloadUrl) {
-        try {
-          const deciphered = await withTimeout(
-            format.decipher(innertube.session.player),
-            5000,
-            'Fresh decipher'
-          );
-          if (deciphered) downloadUrl = String(deciphered);
-        } catch (e) { /* ignore */ }
-      }
-
-      if (downloadUrl && typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
-        console.log(`✅ Fresh Innertube+PO extracted URL (${Date.now() - startTime}ms)`);
-        return { url: downloadUrl, mime: format.mime_type };
-      }
-    }
-  } catch (e: any) {
-    console.warn('⚠️ Fresh Innertube+PO strategy failed:', e.message);
-  }
-
-  console.error(`❌ All strategies failed for ${videoId} (${Date.now() - startTime}ms)`);
-  return null;
-}
-
-/**
- * GET /api/stream/audio/:videoId
- * Returns the deciphered direct audio URL as JSON.
- * FAST version — only uses the already-initialized Innertube (with PO token).
- * If this fails, the frontend falls back to /api/stream/proxy/ automatically.
- */
-app.get('/api/stream/audio/:videoId', async (req, res) => {
-  try {
-    const videoId = req.params.videoId;
-    if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
-
-    console.log(`📡 [FAST] Stream URL request for: ${videoId}`);
-    const startTime = Date.now();
-
-    // Only try Innertube (already has PO token from boot) — 12s max
-    if (!innertube) await initInnertube();
-    if (!innertube) throw new Error('Innertube not ready');
-
-    const info = await withTimeout(innertube.getInfo(videoId), 12000, 'getInfo');
-    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
-
-    if (!format) throw new Error('No audio format found');
-
-    let downloadUrl: string | undefined;
-
-    if (format.url) {
-      downloadUrl = String(format.url);
-    }
-
-    if (!downloadUrl) {
-      const deciphered = await withTimeout(
-        format.decipher(innertube.session.player),
-        5000,
-        'decipher'
-      );
-      if (deciphered) downloadUrl = String(deciphered);
-    }
-
-    if (!downloadUrl || !downloadUrl.startsWith('http')) {
-      throw new Error('Could not extract audio URL');
-    }
-
-    console.log(`✅ [FAST] Extracted in ${Date.now() - startTime}ms`);
-    res.json({ url: downloadUrl, mime: format.mime_type });
-
-  } catch (error: any) {
-    console.error('❌ [FAST] Stream error:', error.message);
-    if (!res.headersSent) {
-      const status = error.message.includes('429') ? 429 : 500;
-      res.status(status).json({ error: error.message });
-    }
-  }
-});
-
-/**
- * GET /api/stream/proxy/:videoId
- * REAL audio proxy — pipes audio bytes directly through the server.
- * This is the KEY endpoint for the APK: ExoPlayer consumes this URL directly.
- * Supports HTTP Range requests for seeking.
+ * Proxy stream handler
  */
 app.get('/api/stream/proxy/:videoId', async (req, res) => {
   try {
     const videoId = req.params.videoId;
-    if (!videoId) return res.status(400).json({ error: 'Video ID is required' });
+    console.log(`🎵 Streaming proxy for: ${videoId}`);
+    
+    const data = await invidiousRequest(`/api/v1/videos/${videoId}`, true);
+    
+    const audioStream = data.adaptiveFormats
+      ?.filter((f: any) => f.type.includes('audio'))
+      ?.sort((a: any, b: any) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
 
-    console.log(`🎧 Proxy stream request for: ${videoId}`);
-
-    const result = await extractAudioUrl(videoId);
-
-    if (!result) {
-      throw new Error('All extraction strategies failed for proxy');
+    if (!audioStream || !audioStream.url) {
+      return res.status(404).json({ error: 'No audio stream found' });
     }
 
-    // Forward the Range header from the client (ExoPlayer uses this for seeking)
-    const rangeHeader = req.headers.range;
-    const headers: Record<string, string> = {
-      'User-Agent': USER_AGENT,
-    };
-    if (rangeHeader) {
-      headers['Range'] = rangeHeader;
-    }
-
-    // Fetch the audio from YouTube and pipe it to the client
-    const audioResponse = await axios.get(result.url, {
-      headers,
+    const response = await axios.get(audioStream.url, {
       responseType: 'stream',
-      timeout: 30000,
-      // Don't validate status because 206 (Partial Content) is valid
-      validateStatus: (status) => status >= 200 && status < 400,
-    });
-
-    // Forward important headers to the client
-    const contentType = result.mime || audioResponse.headers['content-type'] || 'audio/webm';
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'no-cache');
-
-    if (audioResponse.headers['content-length']) {
-      res.setHeader('Content-Length', audioResponse.headers['content-length']);
-    }
-    if (audioResponse.headers['content-range']) {
-      res.setHeader('Content-Range', audioResponse.headers['content-range']);
-    }
-
-    // Use the same status code (200 or 206 for Range)
-    res.status(audioResponse.status);
-
-    // Pipe the audio stream to the response
-    audioResponse.data.pipe(res);
-
-    audioResponse.data.on('error', (err: any) => {
-      console.error('Proxy pipe error:', err.message);
-      if (!res.headersSent) res.status(500).end();
-    });
-
-    // Clean up on client disconnect
-    req.on('close', () => {
-      if (audioResponse.data && typeof audioResponse.data.destroy === 'function') {
-        audioResponse.data.destroy();
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
       }
     });
 
+    res.setHeader('Content-Type', audioStream.container === 'm4a' ? 'audio/mp4' : 'audio/webm');
+    response.data.pipe(res);
+    
   } catch (error: any) {
-    console.error('❌ Proxy stream error:', error.message);
-    if (!res.headersSent) {
-      const status = error.message.includes('429') ? 429 : 500;
-      res.status(status).json({ error: error.message });
-    }
+    console.error('Proxy error:', error.message);
+    res.status(500).json({ error: 'Proxy failed' });
   }
 });
 
-app.get('/api/stream/:videoId', async (req, res) => {
-  try {
-    const videoId = req.params.videoId;
-    console.log(`🎵 Extracting audio direct URL for: ${videoId} using play-dl`);
-
-    const info = await play.video_info(`https://www.youtube.com/watch?v=${videoId}`);
-    const format = info.format.find(f => f.mimeType && f.mimeType.includes('audio') && !f.mimeType.includes('video'));
-
-    if (!format || !format.url) throw new Error('No direct audio URL found');
-
-    res.json({ url: format.url, mime: format.mimeType });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/**
- * GET /api/download/:videoId
- * Downloads the video as an audio file
- */
-app.get('/api/download/:videoId', async (req, res) => {
-  try {
-    const videoId = req.params.videoId;
-    if (!videoId) {
-      return res.status(400).json({ error: 'Video ID is required' });
-    }
-
-    const title = req.query.title ? String(req.query.title).replace(/[^\w\s-]/gi, '') : videoId;
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
-
-    // Extract the raw media URL using play-dl (much faster than youtube-dl-exec)
-    const info = await play.video_info(url);
-    const format = info.format
-      .filter(f => f.mimeType?.includes('audio'))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-
-    if (!format || !format.url) {
-      return res.status(500).json({ error: 'Could not extract audio url' });
-    }
-
-    // Set headers for file download
-    res.setHeader('Content-Disposition', `attachment; filename="${title}.mp3"`);
-    res.setHeader('Content-Type', 'audio/mpeg');
-
-    // Pipe the audio stream securely via https
-    https.get(format.url, (audioStream) => {
-      audioStream.pipe(res);
-
-      audioStream.on('error', (err) => {
-        console.error('Audio stream error:', err);
-        if (!res.headersSent) res.status(500).end();
-      });
-    }).on('error', (err) => {
-      console.error('HTTPS get error:', err);
-      if (!res.headersSent) res.status(500).end();
-    });
-
-  } catch (error: any) {
-    console.error('Download error:', error.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: error.message });
-    }
-  }
-});
-
-/**
- * GET /api/health
- * Health check endpoint
- */
-app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    hasApiKey: !!process.env.YOUTUBE_API_KEY,
-    hasCookies: !!process.env.YOUTUBE_COOKIE,
-    innertubeReady: !!innertube,
-    hasPOToken: !!cachedPOToken,
-    poTokenAge: cachedPOToken ? Math.round((Date.now() - poTokenTimestamp) / 1000) + 's' : 'N/A',
-  });
-});
-
-// Start server
-app.listen(Number(PORT), '0.0.0.0', () => {
-  console.log(`\n🎵 CEGM Music Server running on http://localhost:${PORT}`);
-  console.log(`📡 YouTube API Key: ${process.env.YOUTUBE_API_KEY ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`🍪 YouTube Cookies: ${process.env.YOUTUBE_COOKIE ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`\nEndpoints:`);
-  console.log(`  GET /api/search?q=<query>`);
-  console.log(`  GET /api/trending`);
-  console.log(`  GET /api/video/:id`);
-  console.log(`  GET /api/video/:id/related`);
-  console.log(`  GET /api/channel/:id`);
-  console.log(`  GET /api/channels/search?q=<query>`);
-  console.log(`  GET /api/playlists/search?q=<query>`);
-  console.log(`  GET /api/playlist/:id/items`);
-  console.log(`  GET /api/genres`);
-  console.log(`  GET /api/stream/audio/:videoId  (Deciphered URL)`);
-  console.log(`  GET /api/stream/proxy/:videoId  (Audio proxy for APK)`);
-  console.log(`  GET /api/stream/:videoId        (Legacy)`);
-  console.log(`  GET /api/download/:videoId`);
-  console.log(`  GET /api/health\n`);
-});
-res.status(500).json({ error: 'Proxy failed' });
-  }
-});
-
-// Legacy stream endpoint for compat
 app.get('/api/stream/audio/:videoId', async (req, res) => {
   res.json({ url: `${process.env.RENDER_EXTERNAL_URL || ''}/api/stream/proxy/${req.params.videoId}` });
 });
@@ -683,5 +175,5 @@ app.get('/api/health', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🎵 CEGM Music Server running on http://localhost:${PORT}`);
-  console.log(`📡 Extraction Method: Public Invidious API (Failover enabled)`);
+  console.log(`📡 Backend: Invidious Engine (Stable)`);
 });
