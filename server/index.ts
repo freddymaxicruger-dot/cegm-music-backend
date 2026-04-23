@@ -1,25 +1,37 @@
 import express from 'express';
-import { Readable } from 'stream';
 import cors from 'cors';
 import axios from 'axios';
 import { Innertube } from 'youtubei.js';
+import { Readable } from 'stream';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Global Innertube instance
+// Global Innertube instance with auto-reinit
 let youtube: any;
-Innertube.create().then(it => {
-  youtube = it;
-  console.log('✅ YouTubei.js (InnerTube) initialized');
-}).catch(err => {
-  console.error('❌ Failed to initialize YouTubei.js:', err);
-});
+let youtubeInitTime = 0;
+
+async function getYouTube() {
+  const now = Date.now();
+  if (!youtube || (now - youtubeInitTime > 30 * 60 * 1000)) {
+    try {
+      youtube = await Innertube.create();
+      youtubeInitTime = now;
+      console.log('✅ YouTubei.js (InnerTube) initialized/refreshed');
+    } catch (err) {
+      console.error('❌ Failed to initialize YouTubei.js:', err);
+      youtube = null;
+    }
+  }
+  return youtube;
+}
+
+getYouTube();
 
 app.use(cors());
 app.use(express.json());
 
-// List of Invidious instances for failover
+// Invidious instances for failover
 const INSTANCES = [
   'https://inv.thepixora.com',
   'https://invidious.flokinet.to',
@@ -46,10 +58,136 @@ async function fetchInvidious(endpoint: string) {
       console.warn(`[Invidious] ${host} error: ${e.message}`);
     }
   }
-  throw new Error('All Invidious instances failed. Please try again later.');
+  throw new Error('All Invidious instances failed.');
 }
 
-// 1. Search Videos
+/**
+ * Get the best audio format info using YouTubei.js v17.
+ */
+async function getInnertubeAudio(videoId: string) {
+  const yt = await getYouTube();
+  if (!yt) return null;
+
+  try {
+    const info = await yt.getBasicInfo(videoId, { client: 'ANDROID' });
+    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+    if (!format?.url) return null;
+
+    return {
+      url: format.url,
+      contentType: format.mime_type?.split(';')[0] || 'audio/mp4',
+      contentLength: parseInt(format.content_length) || 0
+    };
+  } catch (err: any) {
+    console.warn(`[InnerTube] Failed for ${videoId}: ${err.message}`);
+    if (err.message?.includes('Could not extract') || err.message?.includes('sign') || err.message?.includes('cipher')) {
+      youtube = null;
+      youtubeInitTime = 0;
+    }
+    return null;
+  }
+}
+
+/**
+ * Stream audio in chunks using native fetch with bounded Range headers.
+ * YouTube blocks open-ended Range requests, so we use bounded ranges.
+ * Includes retry with backoff and URL refresh on 403 errors.
+ */
+const CHUNK_SIZE = 256 * 1024; // 256KB chunks
+const MAX_RETRIES = 3;
+
+function createChunkedStream(
+  audioUrl: string,
+  totalSize: number,
+  startByte: number = 0,
+  videoId?: string,
+  firstBuffer?: Buffer
+): Readable {
+  let currentUrl = audioUrl;
+  let offset = startByte;
+  let aborted = false;
+  let consecutiveFailures = 0;
+  let hasPushedFirst = false;
+
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+  return new Readable({
+    async read() {
+      if (firstBuffer && !hasPushedFirst) {
+        hasPushedFirst = true;
+        offset += firstBuffer.length;
+        this.push(firstBuffer);
+        return;
+      }
+
+      if (aborted || offset >= totalSize) {
+        this.push(null);
+        return;
+      }
+
+      const end = Math.min(offset + CHUNK_SIZE - 1, totalSize - 1);
+
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        if (aborted) { this.push(null); return; }
+
+        try {
+          const resp = await fetch(currentUrl, {
+            headers: { 'Range': `bytes=${offset}-${end}` }
+          });
+
+          if (resp.status === 206 || resp.status === 200) {
+            const buffer = Buffer.from(await resp.arrayBuffer());
+            offset += buffer.length;
+            consecutiveFailures = 0;
+            this.push(buffer);
+            return;
+          }
+
+          if (resp.status === 403) {
+            console.warn(`[Chunked] 403 at offset ${offset}, attempt ${attempt + 1}/${MAX_RETRIES + 1}`);
+
+            if (videoId && attempt < MAX_RETRIES) {
+              await sleep(500 * (attempt + 1));
+              const freshAudio = await getInnertubeAudio(videoId);
+              if (freshAudio?.url && freshAudio.url !== currentUrl) {
+                console.log('[Chunked] Refreshed InnerTube URL, retrying...');
+                currentUrl = freshAudio.url;
+                continue;
+              }
+            }
+            continue;
+          }
+
+          console.error(`[Chunked] Unexpected status ${resp.status} at offset ${offset}`);
+          this.push(null);
+          return;
+        } catch (err: any) {
+          if (aborted) { this.push(null); return; }
+          console.error(`[Chunked] Error at offset ${offset}, attempt ${attempt + 1}: ${err.message}`);
+          if (attempt < MAX_RETRIES) {
+            await sleep(300 * (attempt + 1));
+          }
+        }
+      }
+
+      consecutiveFailures++;
+      if (consecutiveFailures >= 3) {
+        console.error(`[Chunked] Too many consecutive failures, stopping stream`);
+        this.push(null);
+        return;
+      }
+
+      console.warn(`[Chunked] Skipping chunk at offset ${offset}, moving to next...`);
+      offset = end + 1;
+      this.push(Buffer.alloc(0));
+    },
+    destroy() {
+      aborted = true;
+    }
+  });
+}
+
+// 1. Search
 app.get('/api/search', async (req, res) => {
   try {
     const q = req.query.q as string;
@@ -124,7 +262,7 @@ app.get('/api/video/:id/related', async (req, res) => {
   }
 });
 
-// 5. Search Channels (Artists)
+// 5. Search Channels
 app.get('/api/channels/search', async (req, res) => {
   try {
     const q = req.query.q as string;
@@ -192,7 +330,7 @@ app.get('/api/channel/:id', async (req, res) => {
   }
 });
 
-// 9. Genres (Hardcoded to match UI)
+// 9. Genres
 app.get('/api/genres', (req, res) => {
   res.json({
     genres: [
@@ -206,64 +344,92 @@ app.get('/api/genres', (req, res) => {
   });
 });
 
-// 10. Ultimate Streaming Proxy (YouTubei.js -> Invidious Fallback)
+// 10. Streaming Proxy (InnerTube chunked -> Invidious fallback)
 app.get('/api/stream/proxy/:id', async (req, res) => {
   const videoId = req.params.id;
   console.log(`[Stream] Requesting: ${videoId}`);
 
-  // Strategy 1: YouTubei.js (InnerTube)
-  if (youtube) {
+  const audio = await getInnertubeAudio(videoId);
+  if (audio && audio.contentLength > 0) {
     try {
-      console.log(`[Stream] Strategy 1: YouTubei.js...`);
-      const stream = await youtube.download(videoId, {
-        type: 'audio',
-        quality: 'best',
-        format: 'mp4',
-        client: 'YTMUSIC'
-      });
+      console.log(`[Stream] Strategy 1: InnerTube chunked (${(audio.contentLength / 1024 / 1024).toFixed(1)}MB)...`);
 
-      const reader = stream.getReader();
-      res.setHeader('Content-Type', 'audio/mpeg');
-      
-      const pump = async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!res.write(value)) await new Promise(resolve => res.once('drain', resolve));
-          }
-        } catch (e) { console.error('[Pump Error]', e); }
-        finally { res.end(); reader.releaseLock(); }
-      };
-      pump();
-      req.on('close', () => { reader.cancel().catch(() => {}); });
-      return; // Success!
+      let startByte = 0;
+      if (req.headers.range) {
+        const match = req.headers.range.match(/bytes=(\d+)-/);
+        if (match) startByte = parseInt(match[1]);
+      }
+
+      const testEnd = Math.min(startByte + CHUNK_SIZE - 1, audio.contentLength - 1);
+      const testResp = await fetch(audio.url, { headers: { 'Range': `bytes=${startByte}-${testEnd}` }});
+      if (testResp.status !== 206 && testResp.status !== 200) {
+        throw new Error(`InnerTube rejected range ${startByte}-${testEnd} with status ${testResp.status}`);
+      }
+      const firstBuffer = Buffer.from(await testResp.arrayBuffer());
+
+      const stream = createChunkedStream(audio.url, audio.contentLength, startByte, videoId, firstBuffer);
+
+      res.setHeader('Content-Type', audio.contentType);
+      res.setHeader('Accept-Ranges', 'bytes');
+
+      if (startByte > 0) {
+        res.setHeader('Content-Range', `bytes ${startByte}-${audio.contentLength - 1}/${audio.contentLength}`);
+        res.setHeader('Content-Length', audio.contentLength - startByte);
+        res.status(206);
+      } else {
+        res.setHeader('Content-Length', audio.contentLength);
+      }
+
+      stream.pipe(res);
+      req.on('close', () => { stream.destroy(); });
+      return;
     } catch (err: any) {
-      console.warn(`[Stream] YouTubei.js failed: ${err.message}. Falling back to Invidious...`);
+      console.warn(`[Stream] InnerTube chunked failed: ${err.message}`);
     }
   }
 
-  // Strategy 2: Invidious Fallback
+  // Strategy 2: Invidious fallback via proxy
   try {
     console.log(`[Stream] Strategy 2: Invidious Fallback...`);
-    const data = await fetchInvidious(`/api/v1/videos/${videoId}`);
-    let audio = data.adaptiveFormats?.filter((f: any) => f.type && f.type.includes('audio'))
-      ?.sort((a: any, b: any) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
-    
-    if (!audio) audio = data.formatStreams?.filter((f: any) => f.type && f.type.includes('audio'))[0];
-    
-    if (!audio?.url) throw new Error('No audio found in Invidious');
+    const headers: any = { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/' };
+    if (req.headers.range) {
+      headers['Range'] = req.headers.range;
+    }
 
-    const stream = await axios.get(audio.url, {
-      responseType: 'stream',
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/' }
-    });
+    let success = false;
+    for (const host of INSTANCES) {
+      try {
+        const proxyUrl = `${host}/latest_version?id=${videoId}&itag=140&local=true`;
+        console.log(`[Stream] Trying Invidious proxy: ${host}`);
+        
+        const axStream = await axios.get(proxyUrl, {
+          responseType: 'stream',
+          timeout: 15000,
+          headers
+        });
 
-    res.setHeader('Content-Type', 'audio/mpeg');
-    stream.data.pipe(res);
+        res.status(axStream.status);
+        if (axStream.headers['content-type']) res.setHeader('Content-Type', axStream.headers['content-type']);
+        if (axStream.headers['content-length']) res.setHeader('Content-Length', axStream.headers['content-length']);
+        if (axStream.headers['content-range']) res.setHeader('Content-Range', axStream.headers['content-range']);
+        res.setHeader('Accept-Ranges', 'bytes');
+
+        axStream.data.pipe(res);
+        success = true;
+        break; // Stop trying instances
+      } catch (e: any) {
+        console.warn(`[Stream] Invidious proxy failed for ${host}: ${e.message}`);
+      }
+    }
+    
+    if (!success) {
+      throw new Error('All Invidious proxy instances failed');
+    }
   } catch (error: any) {
     console.error(`[Stream] All strategies failed for ${videoId}:`, error.message);
-    res.status(500).send('Streaming failed');
+    if (!res.headersSent) {
+      res.status(500).send('Streaming failed');
+    }
   }
 });
 
@@ -273,30 +439,50 @@ app.get('/api/stream/audio/:id', (req, res) => {
   res.json({ url: `${host}/api/stream/proxy/${req.params.id}` });
 });
 
-// 12. Download Proxy
+// 12. Download
 app.get('/api/download/:id', async (req, res) => {
-  try {
-    const data = await fetchInvidious(`/api/v1/videos/${req.params.id}`);
-    let audio = data.adaptiveFormats
-      ?.filter((f: any) => f.type && f.type.includes('audio'))
-      ?.sort((a: any, b: any) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
+  const videoId = req.params.id;
+  const title = req.query.title ? `${req.query.title}.mp3` : `${videoId}.mp3`;
 
-    if (!audio) {
-      audio = data.formatStreams?.filter((f: any) => f.type && f.type.includes('audio'))[0];
+  const audio = await getInnertubeAudio(videoId);
+  if (audio && audio.contentLength > 0) {
+    try {
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(title)}"`);
+      res.setHeader('Content-Type', audio.contentType);
+      res.setHeader('Content-Length', audio.contentLength);
+
+      const stream = createChunkedStream(audio.url, audio.contentLength, 0, videoId);
+      stream.pipe(res);
+      req.on('close', () => { stream.destroy(); });
+      return;
+    } catch (err: any) {
+      console.warn(`[Download] InnerTube failed: ${err.message}`);
     }
+  }
 
-    if (!audio?.url) return res.status(404).send('No stream');
-
-    const title = req.query.title ? `${req.query.title}.mp3` : `${req.params.id}.mp3`;
+  try {
+    const title = req.query.title ? `${req.query.title}.mp3` : `${videoId}.mp3`;
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(title)}"`);
     
-    const stream = await axios.get(audio.url, { responseType: 'stream' });
-    stream.data.pipe(res);
+    let success = false;
+    for (const host of INSTANCES) {
+      try {
+        const proxyUrl = `${host}/latest_version?id=${videoId}&itag=140&local=true`;
+        const axStream = await axios.get(proxyUrl, { responseType: 'stream', timeout: 15000 });
+        axStream.data.pipe(res);
+        success = true;
+        break;
+      } catch (e: any) {
+        console.warn(`[Download] Invidious proxy failed for ${host}: ${e.message}`);
+      }
+    }
+    
+    if (!success) throw new Error('All Invidious proxy instances failed');
   } catch (e: any) {
     res.status(500).send(e.message);
   }
 });
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', innertube: !!youtube }));
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Stable Backend on port ${PORT}`));
